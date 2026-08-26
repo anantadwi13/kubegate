@@ -101,8 +101,15 @@ func (f *fetcher) getJSON(ctx context.Context, path string, into any) error {
 func (f *fetcher) collect(ctx context.Context, path, group, version string, out policy.StaticScoper) error {
 	var list struct {
 		Resources []struct {
-			Name       string `json:"name"`
-			Namespaced bool   `json:"namespaced"`
+			Name string `json:"name"`
+			// Namespaced is a pointer so a resource entry that omits the
+			// field can be told apart from one that explicitly sets it to
+			// false. Go's zero value for bool is false, which is the
+			// *permissive* reading here (it lets namespaceDecision allow an
+			// unscoped, cluster-wide request through); silently defaulting
+			// to it would fail open on a malformed or truncated discovery
+			// response instead of failing closed.
+			Namespaced *bool `json:"namespaced"`
 		} `json:"resources"`
 	}
 	if err := f.getJSON(ctx, path, &list); err != nil {
@@ -114,7 +121,14 @@ func (f *fetcher) collect(ctx context.Context, path, group, version string, out 
 		if strings.Contains(r.Name, "/") {
 			continue
 		}
-		out[policy.ScoperKey(group, version, r.Name)] = r.Namespaced
+		// A resource whose scope we could not determine must not be
+		// recorded at all: absence means IsNamespaced reports known=false,
+		// which namespaceDecision denies while scoping is active. Recording
+		// it as namespaced=false would instead be the permissive answer.
+		if r.Namespaced == nil {
+			continue
+		}
+		out[policy.ScoperKey(group, version, r.Name)] = *r.Namespaced
 	}
 	return nil
 }

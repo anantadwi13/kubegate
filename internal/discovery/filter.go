@@ -39,36 +39,50 @@ func FilterBody(e *policy.Engine, path string, body []byte) ([]byte, bool, error
 	}
 
 	var changed bool
+	var err error
 	switch root["kind"] {
 	case "APIResourceList":
-		changed = filterResourceList(e, root)
+		changed, err = filterResourceList(e, root)
 	case "APIGroupList":
-		changed = filterGroupList(e, root)
+		changed, err = filterGroupList(e, root)
 	default:
 		return body, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("filtering discovery document at %s: %w", path, err)
 	}
 
 	if !changed {
 		return body, false, nil
 	}
-	out, err := json.Marshal(root)
-	if err != nil {
-		return nil, false, fmt.Errorf("re-encoding discovery document: %w", err)
+	out, marshalErr := json.Marshal(root)
+	if marshalErr != nil {
+		return nil, false, fmt.Errorf("re-encoding discovery document: %w", marshalErr)
 	}
 	return out, true, nil
 }
 
 // filterResourceList keeps only the resources the mode permits a read on.
-func filterResourceList(e *policy.Engine, root map[string]any) bool {
-	resources, ok := root["resources"].([]any)
+//
+// A "resources" field that isn't the array shape a real APIResourceList
+// always has (missing, wrong type, ...) is an error rather than a
+// passthrough: FilterBody must never fall back to returning the original,
+// unfiltered body just because the shape it was asked to filter turned out
+// to be ambiguous.
+func filterResourceList(e *policy.Engine, root map[string]any) (bool, error) {
+	raw, present := root["resources"]
+	if !present {
+		return false, fmt.Errorf(`APIResourceList has no "resources" field`)
+	}
+	resources, ok := raw.([]any)
 	if !ok {
-		return false
+		return false, fmt.Errorf(`APIResourceList "resources" field is not an array`)
 	}
 	group, version := splitGroupVersion(str(root["groupVersion"]))
 
 	kept := make([]any, 0, len(resources))
-	for _, raw := range resources {
-		r, ok := raw.(map[string]any)
+	for _, entry := range resources {
+		r, ok := entry.(map[string]any)
 		if !ok {
 			continue
 		}
@@ -86,40 +100,52 @@ func filterResourceList(e *policy.Engine, root map[string]any) bool {
 			req.Verb = "get"
 			req.Name = "probe"
 		}
-		if e.Authorize(req).Allow {
-			kept = append(kept, raw)
+		// AuthorizesResourceKind, not Authorize: this probes whether the
+		// resource TYPE exists for the mode, which is independent of which
+		// namespace's instances --namespace scoping would let through. Using
+		// Authorize here would hit its empty-namespace-is-ambiguous fallback
+		// and hide every namespaced resource whenever scoping is active.
+		if e.AuthorizesResourceKind(req).Allow {
+			kept = append(kept, entry)
 		}
 	}
 	if len(kept) == len(resources) {
-		return false
+		return false, nil
 	}
 	root["resources"] = kept
-	return true
+	return true, nil
 }
 
 // filterGroupList drops groups that retain no permitted resource. Membership
 // is decided by probing the mode's policy rather than by consulting the
 // allowlist directly, so the two can never disagree.
-func filterGroupList(e *policy.Engine, root map[string]any) bool {
-	groups, ok := root["groups"].([]any)
+//
+// As with filterResourceList, a "groups" field that isn't an array is an
+// error, not a passthrough.
+func filterGroupList(e *policy.Engine, root map[string]any) (bool, error) {
+	raw, present := root["groups"]
+	if !present {
+		return false, fmt.Errorf(`APIGroupList has no "groups" field`)
+	}
+	groups, ok := raw.([]any)
 	if !ok {
-		return false
+		return false, fmt.Errorf(`APIGroupList "groups" field is not an array`)
 	}
 	kept := make([]any, 0, len(groups))
-	for _, raw := range groups {
-		g, ok := raw.(map[string]any)
+	for _, entry := range groups {
+		g, ok := entry.(map[string]any)
 		if !ok {
 			continue
 		}
 		if e.PermitsGroup(str(g["name"])) {
-			kept = append(kept, raw)
+			kept = append(kept, entry)
 		}
 	}
 	if len(kept) == len(groups) {
-		return false
+		return false, nil
 	}
 	root["groups"] = kept
-	return true
+	return true, nil
 }
 
 func splitGroupVersion(gv string) (group, version string) {

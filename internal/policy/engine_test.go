@@ -145,6 +145,27 @@ func TestEngineAuthorizeWithNamespaceScope(t *testing.T) {
 	}
 }
 
+// TestAuthorizesResourceKindIgnoresNamespaceScope guards the fix for a
+// regression a reviewer found in internal/discovery: probing discovery
+// existence through the full Authorize pipeline hit namespaceDecision's
+// empty-namespace-is-ambiguous fallback and denied every namespaced
+// resource whenever --namespace scoping was active, even ones a real
+// scoped request would succeed against.
+func TestAuthorizesResourceKindIgnoresNamespaceScope(t *testing.T) {
+	e := mustEngine(t, Config{Mode: ModeRONoSecret, Namespaces: []string{"app"}, Scoper: testScoper()})
+
+	if d := e.AuthorizesResourceKind(Request{IsResourceRequest: true, APIVersion: "v1", Resource: "pods", Verb: "list"}); !d.Allow {
+		t.Errorf("pods must be allowed as a resource kind despite namespace scoping being active: %s", d.Reason)
+	}
+	if d := e.AuthorizesResourceKind(Request{IsResourceRequest: true, APIVersion: "v1", Resource: "secrets", Verb: "list"}); d.Allow {
+		t.Error("secrets must still be denied by the mode allowlist even when ignoring namespace scope")
+	}
+	// Non-resource paths behave exactly as Authorize would.
+	if d := e.AuthorizesResourceKind(Request{IsResourceRequest: false, Path: "/apis", Verb: "get"}); !d.Allow {
+		t.Errorf("discovery path denied: %s", d.Reason)
+	}
+}
+
 // TestModeMonotonicity asserts the ladder ro-nosecret subset-of ro-secret
 // subset-of rw over every group/resource/subresource/verb combination the
 // rule sets mention, plus unknown ones.

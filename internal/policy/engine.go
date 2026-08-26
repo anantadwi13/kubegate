@@ -49,6 +49,27 @@ func (e *Engine) RedactionEnabled() bool { return e.cfg.Mode == ModeRONoSecret }
 // Every stage can only deny; none can re-permit something an earlier stage
 // rejected. Stages are ordered cheapest-first.
 func (e *Engine) Authorize(req Request) Decision {
+	if d := e.authorizeResourceKind(req); !d.Allow || !req.IsResourceRequest {
+		return d
+	}
+	return namespaceDecision(e.cfg.Namespaces, e.cfg.Scoper, req)
+}
+
+// AuthorizesResourceKind runs every stage of Authorize except namespace
+// scoping. It exists for internal/discovery: whether a resource TYPE should
+// be advertised in a discovery document is a question about the mode and
+// verb, not about which namespace's instances are visible, and running the
+// existence probe through namespaceDecision would hit its
+// empty-namespace-is-ambiguous fallback and deny every namespaced resource
+// outright whenever --namespace scoping is active — hiding resources that a
+// real, correctly-scoped request would actually be allowed to read.
+func (e *Engine) AuthorizesResourceKind(req Request) Decision {
+	return e.authorizeResourceKind(req)
+}
+
+// authorizeResourceKind is Authorize minus the final namespace-scoping
+// stage.
+func (e *Engine) authorizeResourceKind(req Request) Decision {
 	if !req.IsResourceRequest {
 		return nonResourceDecision(req.Path)
 	}
@@ -58,10 +79,7 @@ func (e *Engine) Authorize(req Request) Decision {
 	if d := verbGateDecision(e.cfg.Mode, req); !d.Allow {
 		return d
 	}
-	if d := modeResourceDecision(e.cfg.Mode, e.cfg.Extra, req); !d.Allow {
-		return d
-	}
-	return namespaceDecision(e.cfg.Namespaces, e.cfg.Scoper, req)
+	return modeResourceDecision(e.cfg.Mode, e.cfg.Extra, req)
 }
 
 // PermitsGroup reports whether any rule in this mode's allowlist mentions

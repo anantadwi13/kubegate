@@ -101,3 +101,44 @@ func TestBuildScoperFailsOnUnreachableServer(t *testing.T) {
 		t.Error("an unreachable apiserver must be an error, not an empty scoper")
 	}
 }
+
+// TestBuildScoperOmitsResourceMissingNamespacedField guards a fail-open a
+// reviewer demonstrated live: a resource entry lacking the "namespaced" key
+// used to be recorded as namespaced=false — Go's zero value, and the
+// *permissive* reading, since it lets namespaceDecision allow an unscoped,
+// cluster-wide request through. It must instead be left out of the map
+// entirely, so IsNamespaced reports known=false and namespaceDecision
+// denies it while scoping is active.
+func TestBuildScoperOmitsResourceMissingNamespacedField(t *testing.T) {
+	mux := http.NewServeMux()
+	write := func(w http.ResponseWriter, body string) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}
+	mux.HandleFunc("/api/v1", func(w http.ResponseWriter, _ *http.Request) {
+		write(w, `{"kind":"APIResourceList","groupVersion":"v1","resources":[
+			{"name":"pods","namespaced":true},
+			{"name":"mysteryresource"}]}`)
+	})
+	mux.HandleFunc("/apis", func(w http.ResponseWriter, _ *http.Request) {
+		write(w, `{"kind":"APIGroupList","groups":[]}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	base, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := BuildScoper(context.Background(), http.DefaultTransport, base)
+	if err != nil {
+		t.Fatalf("BuildScoper: %v", err)
+	}
+
+	if _, known := s.IsNamespaced("", "v1", "mysteryresource"); known {
+		t.Error("a resource missing the \"namespaced\" field must not be recorded in the scoper at all")
+	}
+	if ns, known := s.IsNamespaced("", "v1", "pods"); !known || !ns {
+		t.Errorf("pods must still be recorded correctly: namespaced=%v known=%v", ns, known)
+	}
+}
