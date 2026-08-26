@@ -103,3 +103,18 @@ func TestStreamEmptyInput(t *testing.T) {
 		t.Errorf("empty input produced output: %q", out.String())
 	}
 }
+
+func TestStreamMalformedObjectFieldFailsClosed(t *testing.T) {
+	// A frame with "object" present but not a JSON object (e.g., an array)
+	// must produce an error, not silently pass through unredacted.
+	// This is a regression test for the fail-open bug.
+	in := `{"type":"ADDED","object":["not","an","object"]}` + "\n"
+	var out bytes.Buffer
+	err := Stream(&out, strings.NewReader(in), nil)
+	if err == nil {
+		t.Fatal("a frame with malformed object field must return an error (fail closed), not pass through unredacted")
+	}
+	if strings.Contains(out.String(), "not") {
+		t.Error("the malformed frame must not reach the client")
+	}
+}

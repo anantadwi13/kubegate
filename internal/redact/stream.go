@@ -69,9 +69,17 @@ func writeFrame(dst io.Writer, line []byte, flush func()) error {
 	if err := json.Unmarshal(trimmed, &frame); err != nil {
 		return fmt.Errorf("decoding watch frame: %w", err)
 	}
-	if obj, ok := frame["object"].(map[string]any); ok {
+
+	// If "object" field is present, it must be a JSON object (map).
+	// If it's present but wrong type (e.g., array, string), fail closed.
+	if objRaw, hasObject := frame["object"]; hasObject {
+		obj, ok := objRaw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("watch frame object field is not a JSON object: %T", objRaw)
+		}
 		Object(obj, "")
 	}
+
 	out, err := json.Marshal(frame)
 	if err != nil {
 		return fmt.Errorf("re-encoding watch frame: %w", err)
