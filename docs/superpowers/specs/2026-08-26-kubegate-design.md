@@ -410,6 +410,26 @@ When `--namespace` is set:
 - Cluster-scoped resources permitted by the mode remain readable. `--namespace`
   narrows namespaced access; it does not imply "nothing cluster-scoped".
 
+**Distinguishing the two `Namespace == ""` cases.** `GET /api/v1/pods` (a
+cluster-wide collection of a namespaced resource, which must be denied) and `GET
+/api/v1/nodes` (a cluster-scoped resource, which must be allowed) both parse to an
+empty `Namespace`. `RequestInfo` cannot separate them, so policy needs one extra
+fact: whether the resource is namespaced.
+
+That fact comes from the cluster's own discovery document, fetched at startup and
+refreshed periodically, into a `(group, version, resource) → namespaced` map. To
+keep `internal/policy` pure, it is injected as an interface rather than looked up:
+
+```go
+type ResourceScoper interface {
+    IsNamespaced(group, version, resource string) (namespaced, known bool)
+}
+```
+
+An **unknown** resource is denied when scoping is active — fail closed, consistent
+with §2. The map is built **only when `--namespace` is set**, so the default path
+needs no discovery call at all.
+
 When `--namespace` is unset — the default — **no namespace constraint applies at
 all**. Cluster-wide collection requests such as `GET /api/v1/pods` (`kubectl get
 pods -A`) are permitted, subject only to the mode's verb gate and resource rules.
