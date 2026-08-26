@@ -340,7 +340,11 @@ When `--namespace` is set:
 - Cluster-scoped resources permitted by the mode remain readable. `--namespace`
   narrows namespaced access; it does not imply "nothing cluster-scoped".
 
-When `--namespace` is unset, no namespace constraint applies.
+When `--namespace` is unset — the default — **no namespace constraint applies at
+all**. Cluster-wide collection requests such as `GET /api/v1/pods` (`kubectl get
+pods -A`) are permitted, subject only to the mode's verb gate and resource rules.
+Namespace scope is strictly opt-in: the denial above is a consequence of asking
+for scoping, never the default posture.
 
 ### 6.7 Discovery filtering
 
@@ -557,8 +561,10 @@ is nearly free, and it is where a bypass would hide. Table-driven over
 /apis/bitnami.com/v1alpha1/sealedsecrets             unknown secret CRD → deny
 /apis/example.com/v1/widgets                         unknown CRD       → deny
 /apis/rbac.authorization.k8s.io/v1/clusterrolebindings
-/api/v1/pods                                         cluster-wide, --namespace set
-/api/v1/namespaces/other/pods                        namespace mismatch
+/api/v1/pods                                         cluster-wide, --namespace set   → deny
+/api/v1/pods                                         cluster-wide, no --namespace    → allow
+/api/v1/namespaces/other/pods                        namespace mismatch              → deny
+/api/v1/namespaces/other/pods                        no --namespace                  → allow
 /logs  /debug/pprof/  /metrics  /openapi/v3          non-resource paths
 HEAD, OPTIONS                                        unusual methods
 ```
@@ -631,6 +637,7 @@ kubeconfig, driving the real `kubectl`:
 | `delete pod` | ❌ 403 | ❌ 403 | ✅ |
 | `apply -f deployment.yaml` | ❌ 403 | ❌ 403 | ✅ |
 | `create clusterrolebinding` | ❌ 403 | ❌ 403 | ✅ |
+| `get pods -A`, no `--namespace` (default) | ✅ | ✅ | ✅ |
 | `get pods -A` with `--namespace app` | ❌ 403 | ❌ 403 | ❌ 403 |
 | `get pods -n other` with `--namespace app` | ❌ 403 | ❌ 403 | ❌ 403 |
 | `get pods -w` streams | ✅ | ✅ | ✅ |
