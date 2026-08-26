@@ -162,7 +162,12 @@ paste into the guest. Nothing is written to any shared or guest-visible location
 `net/http`. That is what makes exhaustive table-driven testing cheap, and it is
 where nearly all of the security-relevant logic lives.
 
-### 3.5 Dependencies
+### 3.5 Module and dependencies
+
+Module path `github.com/anantadwi13/kubegate`, Go 1.26. Single static binary, no
+cgo. Built and tested on `linux/arm64` and `darwin/arm64`; the proxy runs on the
+host, so `darwin` is the primary target and `linux` is what CI and the Lima guest
+use.
 
 - `k8s.io/client-go` — kubeconfig loading, `rest.Config`, `rest.TransportFor`.
   Exec-plugin invocation, token caching, and refresh come free.
@@ -265,11 +270,34 @@ Denied regardless of mode, and not grantable through `--policy`:
   covers `pods/exec`, `pods/attach`, `pods/portforward`, `pods/proxy`,
   `services/proxy`, and `nodes/proxy`.
 - `serviceaccounts/token`.
+- **Write verbs** (`create`, `update`, `patch`, `delete`, `deletecollection`) on
+  `certificatesigningrequests`, and **all verbs** on
+  `certificatesigningrequests/approval` and `certificatesigningrequests/status`.
 - Any request carrying `Connection: Upgrade`, rejected at step 2 before parsing.
+
+Note that CSRs remain **readable** wherever the mode otherwise permits reads.
+Reading a CSR yields the request and, if issued, the signed certificate — but
+never the private key, which the apiserver never holds. Minting is the danger, not
+inspection, so only the write paths are closed.
 
 Because interactive subresources are denied everywhere, `kubegate` never
 implements SPDY or WebSocket protocol upgrade forwarding at all. A whole class of
 proxying bugs is designed out rather than guarded against.
+
+### 6.3.1 Monotonicity invariant
+
+The modes form a strict ladder:
+
+```
+ro-nosecret  ⊆  ro-secret  ⊆  rw
+```
+
+Anything permitted by a stricter mode must be permitted by a looser one. This is
+not decoration — it is what makes the modes comprehensible, and it is easy to
+break by accident (an earlier draft of this spec denied `certificatesigningrequests`
+outright in `rw`, which made `kubectl get csr` fail in read-write while succeeding
+in read-only). §12.1 asserts the invariant as a property test rather than trusting
+review to catch it.
 
 ### 6.4 Mode rule sets
 
@@ -284,6 +312,7 @@ Verb gate: `get`, `list`, `watch`. Then:
 | `batch` | `jobs`, `cronjobs` |
 | `networking.k8s.io` | `ingresses`, `ingressclasses`, `networkpolicies` |
 | `discovery.k8s.io` | `endpointslices` |
+| `events.k8s.io` | `events` |
 | `autoscaling` | `horizontalpodautoscalers` |
 | `policy` | `poddisruptionbudgets` |
 | `storage.k8s.io` | `storageclasses`, `csidrivers`, `csinodes`, `volumeattachments` |
@@ -293,10 +322,26 @@ Verb gate: `get`, `list`, `watch`. Then:
 | `metrics.k8s.io` | `pods`, `nodes` (so `kubectl top` works) |
 | `apiextensions.k8s.io` | `customresourcedefinitions` — the *schemas*, never instances |
 
+Both `events` groups are listed because Kubernetes has two: `kubectl describe`
+reads the core one, `kubectl events` reads `events.k8s.io`. Omitting either makes
+`describe` lose its event footer, which is where most of its diagnostic value is.
+
 Deliberately absent, and denied by the fail-closed default: `secrets`, all of
 `rbac.authorization.k8s.io`, `certificates.k8s.io`,
 `admissionregistration.k8s.io`, the `*Review` authorization APIs, and every CRD
 instance until opted in.
+
+The organizing principle for what is in: **workload observability, not security
+posture.** RBAC bindings, CSRs, and admission webhooks tell you how the cluster is
+secured and who can do what — useful to an attacker mapping the environment,
+rarely needed to find out why a Deployment is crashlooping. They stay out even
+though none of them contains a secret. This does not violate §6.3.1: monotonicity
+requires the stricter mode to permit *no more* than the looser one, not the same.
+
+A consequence worth knowing: `kubectl auth can-i` uses a `create` on
+`selfsubjectaccessreviews`, so it does not work in either read-only mode. That is
+correct behavior — the answer it would give describes the *host* identity, not the
+caller's actual capability, so it would be actively misleading.
 
 #### `ro-secret` — denylist
 
@@ -305,12 +350,11 @@ Everything else is permitted, `secrets` and RBAC objects included.
 
 #### `rw` — denylist
 
-All verbs. Denied: the universal denylist, plus
+All verbs. Denied: the universal denylist (§6.3) and nothing further.
 
-- `certificatesigningrequests` (all verbs)
-- `certificatesigningrequests/approval`
-
-Both mint credentials usable *outside* the proxy, which is a boundary escape
+The credential-minting paths — `serviceaccounts/token` and the CSR write and
+approval paths — live in the universal denylist precisely because they matter most
+here. They mint credentials usable *outside* the proxy, which is a boundary escape
 rather than an escalation (§2). Everything else is permitted, including RBAC
 writes.
 
@@ -358,8 +402,10 @@ The other two modes pass discovery through untouched.
 ### 6.8 The `--policy` extension file
 
 `--policy` extends the `ro-nosecret` allowlist — typically to admit an
-application's own CRDs. It is ignored in the two denylist modes, where it would
-mean nothing.
+application's own CRDs. Passing it together with `--mode ro-secret` or `--mode rw`
+is a **startup error**, not a silent no-op: those modes have no allowlist to
+extend, and quietly ignoring the flag would let someone believe they had
+constrained a proxy that is in fact wide open.
 
 ```yaml
 # extends the ro-nosecret allowlist; cannot subtract from it
@@ -375,8 +421,8 @@ malformed policy can never quietly widen access:
 - `apiGroups` and `resources` must be literal. `*` is rejected — a wildcard would
   defeat the fail-closed property that is the entire point of the mode.
 - `verbs` may only be `get`, `list`, or `watch`, matching the mode's verb gate.
-- No rule may name `secrets`, any resource in `rbac.authorization.k8s.io` or
-  `certificates.k8s.io`, or anything on the universal denylist (§6.3).
+- No rule may name `secrets`, any resource in `rbac.authorization.k8s.io`, or
+  anything on the universal denylist (§6.3).
 
 The file can only ever add resources to a single mode's allowlist. It cannot
 change the verb gate, disable redaction, widen namespace scope, or override the
@@ -445,6 +491,20 @@ startup for pinning as `certificate-authority-data` in the guest.
 Pinning matters: without it, anything on the shared network segment can present
 its own certificate, harvest the bearer token, and hold the whole capability.
 
+The `--tls-dir` directory is created `0700`, the key and certificate files `0600`.
+
+**HTTP/2 is disabled on the listener** (`TLSNextProtos: ["http/1.1"]`). Two
+reasons. First, `Connection: Upgrade` does not exist in HTTP/2 — RFC 8441 tunnels
+WebSocket through extended `CONNECT` instead — so the step-2 header check is
+simply inapplicable there, and a defense-in-depth layer that silently stops
+applying is worse than none. Second, HTTP/1.1 keeps the proxying model small, and
+`kubectl` works over it without complaint.
+
+To be explicit about which check is load-bearing: **the `*/exec`, `*/attach`,
+`*/portforward`, `*/proxy` subresource denial in §6.3 is authoritative.** The
+`Connection: Upgrade` rejection is a cheap outer guard that fails fast; it is not
+what makes interactive access impossible.
+
 ### 8.3 Proxy token
 
 32 bytes from `crypto/rand`, base64url-encoded, persisted to `--token-file` at
@@ -482,12 +542,17 @@ credential detail. `kubectl` renders them as
 `Error from server (Forbidden): pods is forbidden: denied by kubegate policy (mode=ro-nosecret)`.
 
 **Startup validation.** Before binding the listener, the proxy issues `GET
-/version` upstream. Expired SSO is the most common real-world failure, and it
-should surface when the developer starts the proxy on the host, not when the
-guest runs its first command.
+/version` upstream, using the upstream transport directly — this is the proxy's
+own client call and does not traverse the middleware chain, since there is no
+inbound request to authorize. Expired SSO is the most common real-world failure,
+and it should surface when the developer starts the proxy on the host, not when
+the guest runs its first command.
 
-**Body cap.** Write bodies in `rw` are capped at 8 MiB, comfortably above real
-manifests and below what would let a guest exhaust host memory.
+**Body cap.** Request bodies are capped at 8 MiB in **every** mode — comfortably
+above real manifests and below what would let a guest exhaust host memory. The cap
+is not conditional on the mode: the read-only modes permit no body-bearing verbs,
+so a body arriving there is already anomalous and should be truncated rather than
+buffered.
 
 **Shutdown.** SIGINT/SIGTERM stops accepting, drains in-flight non-streaming
 requests, and closes streaming connections after a grace period.
@@ -556,7 +621,11 @@ is nearly free, and it is where a bypass would hide. Table-driven over
 /api/v1/namespaces/x/secrets/na%2Fme                 percent-encoded separator
 /api/v1/pods?watch=true                              vs. the /watch/ form
 /api/v1/namespaces/x/serviceaccounts/y/token         POST — rw escape
-.../certificatesigningrequests/c/approval            PUT  — rw escape
+.../certificatesigningrequests/c/approval            PUT  — rw escape → deny
+.../certificatesigningrequests                       GET  — deny in ro-nosecret (not
+                                                            in allowlist), allow in
+                                                            ro-secret and rw
+.../certificatesigningrequests                       POST — mint → deny (all modes)
 /apis/external-secrets.io/v1beta1/externalsecrets    unknown secret CRD → deny
 /apis/bitnami.com/v1alpha1/sealedsecrets             unknown secret CRD → deny
 /apis/example.com/v1/widgets                         unknown CRD       → deny
@@ -577,6 +646,18 @@ produces an error rather than passthrough.
 
 **`internal/authn`**: `Impersonate-*`, `X-Remote-*`, and client `Authorization`
 absent from the forwarded request.
+
+**Monotonicity property test** (§6.3.1). Over the cross product of every group,
+resource, subresource, and verb appearing anywhere in any rule set — plus a
+generated set of unknown ones — assert:
+
+```
+allow(ro-nosecret, r) ⟹ allow(ro-secret, r) ⟹ allow(rw, r)
+```
+
+This is cheap because the policy is pure, and it catches the class of mistake that
+review misses: a denial added to one mode that should have gone in the universal
+denylist, or vice versa.
 
 ### 12.2 Integration tests — `envtest`
 
@@ -603,11 +684,12 @@ that proves the promises in a way unit tests cannot.
 `KUBEGATE_E2E=1`, since it requires Docker.
 
 ```
-k3d cluster create kubegate-e2e --agents 1 --image rancher/k3s:v1.31.5-k3s1
+k3d cluster create kubegate-e2e --agents 1 --image rancher/k3s:v1.31.14-k3s1
 ```
 
 k3d v5.5.0 defaults to k3s v1.26.4, which is old enough to miss current API
-shapes, so the image is pinned explicitly. The k3d-written kubeconfig is the
+shapes, so the image is pinned explicitly. `v1.31.14-k3s1` is verified to exist
+with an `arm64` manifest. The k3d-written kubeconfig is the
 *host* kubeconfig; the proxy binds `127.0.0.1` (the VM-facing interface is not
 needed to test policy).
 
@@ -634,6 +716,10 @@ kubeconfig, driving the real `kubectl`:
 | `exec` into a pod | ❌ 403 | ❌ 403 | ❌ 403 |
 | `port-forward` | ❌ 403 | ❌ 403 | ❌ 403 |
 | `create token <sa>` | ❌ 403 | ❌ 403 | ❌ 403 |
+| `get csr` | ❌ 403 | ✅ | ✅ |
+| `certificate approve <csr>` | ❌ 403 | ❌ 403 | ❌ 403 |
+| `describe pod` → events footer present | ✅ | ✅ | ✅ |
+| `events` (uses `events.k8s.io`) | ✅ | ✅ | ✅ |
 | `delete pod` | ❌ 403 | ❌ 403 | ✅ |
 | `apply -f deployment.yaml` | ❌ 403 | ❌ 403 | ✅ |
 | `create clusterrolebinding` | ❌ 403 | ❌ 403 | ✅ |
@@ -654,10 +740,26 @@ Plus, independent of mode:
 - request with a wrong token → 401; with no token → 401
 - request over plain HTTP to the TLS port → connection failure, not a downgrade
 - `Connection: Upgrade` on an otherwise-allowed path → 403
-- **A discovery-walk coverage test**: enumerate every resource the live cluster
-  advertises and assert each receives an *explicit* decision. This is what
-  catches accidental fall-through when a real cluster grows a CRD, and it is the
-  single highest-value test in the suite for the fail-closed guarantee.
+- the TLS handshake advertises `http/1.1` only — no `h2` offered via ALPN (§8.2)
+- **A discovery-walk classification test.** Enumerate every resource and
+  subresource the live cluster advertises, run each through the policy in all
+  three modes, and:
+  1. Assert every entry in the `ro-nosecret` allowlist corresponds to something
+     the cluster actually advertises. This catches the failure mode nothing else
+     will — a typo or a stale group (`ingresses` moving out of `extensions`,
+     `cronjobs` out of `batch/v1beta1`) silently denies a resource we believe we
+     permit, and no allow/deny assertion notices because the path never appears.
+  2. Assert every universal-denylist entry that the cluster advertises is in fact
+     denied, so the denylist is spelled the way the cluster spells it.
+  3. Assert the monotonicity invariant (§6.3.1) holds for every advertised entry.
+  4. Write the full three-mode classification to a **golden file**. A cluster
+     gaining a CRD then shows up as a reviewable diff rather than silently
+     changing what is reachable.
+
+  Point 4 is the real safety net for the fail-closed guarantee. Asserting "every
+  resource gets a decision" would be tautological — the allowlist denies unknowns
+  by construction. Making the *set* of denied things visible and diffable is what
+  actually catches drift.
 
 Teardown deletes the cluster. CI-safe: one cluster per run, unique name.
 
