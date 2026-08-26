@@ -153,6 +153,29 @@ func TestEngineAuthorizeWithNamespaceScope(t *testing.T) {
 // mode that belonged in the universal denylist, or the reverse. An earlier
 // draft of the spec denied certificatesigningrequests outright in rw, which
 // made kubectl get csr fail in read-write while succeeding in read-only.
+func TestEnginePermitsGroup(t *testing.T) {
+	strict := mustEngine(t, Config{Mode: ModeRONoSecret})
+	for _, g := range []string{"", "apps", "batch", "metrics.k8s.io", "events.k8s.io"} {
+		if !strict.PermitsGroup(g) {
+			t.Errorf("ro-nosecret must permit group %q", g)
+		}
+	}
+	for _, g := range []string{"rbac.authorization.k8s.io", "certificates.k8s.io", "external-secrets.io", "example.com"} {
+		if strict.PermitsGroup(g) {
+			t.Errorf("ro-nosecret must not permit group %q", g)
+		}
+	}
+	extra := RuleSet{{APIGroups: []string{"example.com"}, Resources: []string{"widgets"}, Verbs: []string{"get"}}}
+	if !mustEngine(t, Config{Mode: ModeRONoSecret, Extra: extra}).PermitsGroup("example.com") {
+		t.Error("extension rules must make their group visible in discovery")
+	}
+	for _, m := range []Mode{ModeROSecret, ModeRW} {
+		if !mustEngine(t, Config{Mode: m}).PermitsGroup("anything.example.com") {
+			t.Errorf("mode %s must permit every group", m)
+		}
+	}
+}
+
 func TestModeMonotonicity(t *testing.T) {
 	groups := []string{"", "apps", "batch", "certificates.k8s.io", "rbac.authorization.k8s.io",
 		"metrics.k8s.io", "events.k8s.io", "example.com", "external-secrets.io"}

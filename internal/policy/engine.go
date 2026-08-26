@@ -63,3 +63,25 @@ func (e *Engine) Authorize(req Request) Decision {
 	}
 	return namespaceDecision(e.cfg.Namespaces, e.cfg.Scoper, req)
 }
+
+// PermitsGroup reports whether any rule in this mode's allowlist mentions
+// the given API group. It exists for discovery filtering: a group retaining
+// no permitted resource is dropped from APIGroupList so that
+// kubectl api-resources shows only what works.
+//
+// The denylist modes permit every group, so they always return true.
+func (e *Engine) PermitsGroup(group string) bool {
+	if e.cfg.Mode != ModeRONoSecret {
+		return true
+	}
+	for _, rs := range []RuleSet{roNoSecretAllow, e.cfg.Extra} {
+		for _, r := range rs {
+			for _, g := range r.APIGroups {
+				if g == "*" || g == group {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
