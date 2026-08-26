@@ -1,0 +1,678 @@
+# kubegate — credential-injecting Kubernetes API proxy
+
+**Date:** 2026-08-26
+**Status:** Design approved, pending implementation plan
+
+## 1. Problem
+
+A developer VM (a Lima guest) needs to talk to Kubernetes clusters, but must not
+hold cluster credentials. Today the guest carries a copy of `~/.kube/config`,
+which means every process in the VM — including AI agents running there — holds
+the developer's full cluster identity. Credentials also expire constantly,
+because the host's kubeconfig authenticates through exec plugins (`aws eks
+get-token`, `gcloud`, corporate SSO) that cannot be meaningfully copied into a
+VM anyway.
+
+`kubegate` runs on the **host**, holds the real credentials, and exposes a
+credential-injecting proxy to the **guest**. The guest's kubeconfig contains no
+cluster credential — only a proxy-scoped bearer token and a pinned CA.
+
+### Goals
+
+- No cluster credential of any kind exists inside the VM.
+- The target cluster is chosen on the host and is not selectable by the client.
+- Three capability tiers, each enforced by the proxy: read-only without secrets,
+  read-only with secrets, read-write.
+- Standard `kubectl` and client-go tooling work in the guest unmodified.
+- Every request is authorized and audited.
+
+### Non-goals
+
+- Multi-tenancy. One proxy process serves one context in one mode.
+- Replacing cluster RBAC. `kubegate` can only ever narrow what the host identity
+  is already permitted to do.
+- Interactive session forwarding (`exec`, `attach`, `port-forward`). Explicitly
+  refused in all modes; see §6.3.
+- High availability, horizontal scaling, or serving more than a handful of
+  clients.
+
+## 2. Threat model
+
+**The VM is untrusted.** Anything running in the guest — a compromised
+dependency, a runaway agent, a process the developer did not start — may issue
+arbitrary requests to the proxy. The proxy's mode is therefore the *ceiling* of
+what the entire VM can do, not a hint.
+
+Consequences that drive the design:
+
+1. **Deny by default in the strict mode.** An unrecognized resource in
+   `ro-nosecret` is denied, not passed through. New CRDs from a secret-manager
+   operator must not become readable because nobody updated a denylist.
+2. **Never fail open.** A parse error, a redaction failure, or an internal error
+   produces an error response, never an unfiltered one.
+3. **No path to the upstream transport that bypasses policy.** Credentials are
+   injected in the transport, at the last step, after every check has passed.
+4. **Escaping the proxy is worse than escalating inside it.** A caller that can
+   mint a cluster credential (`serviceaccounts/token`, CSR approval) can talk to
+   the apiserver directly, with no policy and no audit trail. Those paths are
+   denied even in `rw`.
+5. **The bearer token is the entire capability**, so it never crosses the network
+   in plaintext (§8.3).
+
+### Accepted residual risks
+
+These are conscious trade-offs, documented so they are not mistaken for
+oversights:
+
+- **`pods/log` is readable in `ro-nosecret`.** An application that logs its own
+  credentials will leak them. The mode's guarantee is therefore precisely: *no
+  Secret objects, and no secret material in the manifest fields we redact* — not
+  "no secret material ever". Logs were judged indispensable for the mode to have
+  any diagnostic value.
+- **`rw` permits RBAC writes.** A caller in `rw` can grant itself any permission
+  the proxy will forward. This is bounded, not unbounded: with credential minting
+  and interactive subresources denied, every resulting action still flows through
+  `kubegate`, where it is filtered and logged.
+- **Legacy service-account-token Secrets.** On clusters where the legacy token
+  controller still populates Secrets of type
+  `kubernetes.io/service-account-token`, a caller in `rw` could create such a
+  Secret and read a real token from it. Closing this requires request-body
+  inspection on Secret writes, which was deliberately left out of v1. It does not
+  affect either read-only mode.
+- **Whole-VM capability.** The token is provisioned into the guest, so every
+  process in the guest shares the mode. Per-process authorization is out of
+  scope.
+
+## 3. Architecture
+
+### 3.1 Topology
+
+```
+┌───────────────────────── host (macOS) ──────────────────────────┐
+│  ~/.kube/config  ──►  kubegate serve                            │
+│  (exec plugins,        --context prod-eks                       │
+│   client certs)        --mode ro-nosecret                       │
+│                        --listen 192.168.5.2:8443                │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │ HTTPS, self-signed cert
+                               │ Authorization: Bearer <proxy token>
+┌──────────────────────────────┴──────────────────────────────────┐
+│  Lima guest — kubeconfig holds ONLY:                            │
+│    server: https://192.168.5.2:8443                             │
+│    certificate-authority-data: <kubegate CA>                    │
+│    token: <proxy token>                                         │
+│  No cluster credential. No context selection.                   │
+└─────────────────────────────────────────────────────────────────┘
+                               │
+                    kubegate ──┴──►  real kube-apiserver
+                    (host credentials injected here)
+```
+
+### 3.2 Process shape
+
+One process per `(context, mode)` pair. Both are fixed at startup and immutable
+for the process lifetime. There is no admin API, no config reload, and no way for
+a client to change either. Running against a second cluster or in a second mode
+means starting a second process on a different port.
+
+This is the single largest simplification in the design: the policy engine never
+has to ask "which mode is this request in", and the blast radius of any given
+process is legible from its command line.
+
+### 3.3 CLI
+
+```
+kubegate serve \
+  --context prod-eks \                  # required; immutable
+  --mode ro-nosecret|ro-secret|rw \     # required; immutable
+  --listen 192.168.5.2:8443 \           # required; VM-facing address
+  --namespace foo,bar \                 # optional; empty = cluster-wide
+  --policy extra-rules.yaml \           # optional; extends ro-nosecret only
+  --kubeconfig ~/.kube/config \         # default: $KUBECONFIG, then ~/.kube/config
+  --tls-dir ~/.kubegate \               # cert + key persisted here
+  --token-file ~/.kubegate/token \      # persisted; survives restarts
+  --rotate-token \                      # discard and regenerate the token
+  --tls-san extra.host.name \           # repeatable; added to cert SANs
+  --audit-log ~/.kubegate/audit.jsonl   # default: stderr
+```
+
+There is no flag governing `pods/log`: it is unconditionally in the `ro-nosecret`
+allowlist (§2, residual risks). If logs are later moved behind a gate,
+`--allow-logs` is the intended spelling.
+
+On startup, after validating credentials (§9), the proxy prints to stderr: the
+server URL, the CA in PEM, the token, and a complete kubeconfig snippet ready to
+paste into the guest. Nothing is written to any shared or guest-visible location.
+
+### 3.4 Packages
+
+| Package | Responsibility | HTTP-aware |
+|---|---|---|
+| `cmd/kubegate` | Flag parsing, wiring, startup validation | – |
+| `internal/upstream` | kubeconfig + context → `*rest.Config` → `http.RoundTripper` | yes |
+| `internal/authn` | Constant-time bearer compare; inbound header scrubbing | yes |
+| `internal/reqinfo` | Wrapper over apiserver's `RequestInfoFactory` | yes |
+| `internal/policy` | Rule types, matcher, mode rule sets, namespace scope | **no** |
+| `internal/redact` | Streaming JSON transform of response bodies | no |
+| `internal/discovery` | Filters discovery documents to the mode's allowlist | no |
+| `internal/audit` | Structured one-line-per-request log | no |
+| `internal/server` | TLS, reverse proxy, middleware chain, shutdown | yes |
+
+`internal/policy` and `internal/redact` are pure and take no dependency on
+`net/http`. That is what makes exhaustive table-driven testing cheap, and it is
+where nearly all of the security-relevant logic lives.
+
+### 3.5 Dependencies
+
+- `k8s.io/client-go` — kubeconfig loading, `rest.Config`, `rest.TransportFor`.
+  Exec-plugin invocation, token caching, and refresh come free.
+- `k8s.io/apiserver/pkg/endpoints/request` — `RequestInfoFactory`, the
+  apiserver's own request parser.
+- `k8s.io/apimachinery` — `metav1.Status`, `metav1.Table`, unstructured decoding.
+- `sigs.k8s.io/controller-runtime/pkg/envtest` — integration tests only.
+
+Hand-rolling Kubernetes URL parsing was explicitly rejected. The legacy
+`/api/v1/watch/...` prefix, subresource-versus-name ambiguity, groupless `/api`
+versus grouped `/apis`, and non-resource paths are exactly where an authorization
+bypass hides. `RequestInfoFactory` is the code the apiserver itself trusts for
+this.
+
+## 4. Request lifecycle
+
+```
+client request (HTTPS + Bearer)
+  │
+  1. TLS terminate
+  2. reject if Connection: Upgrade present            → 403
+  3. authn: constant-time token compare               → 401 on mismatch
+     scrub Authorization, Impersonate-*, X-Remote-*   (never forwarded)
+  4. reqinfo: parse → {verb, group, version, resource,
+                       subresource, namespace, name,
+                       isResourceRequest}
+  5. non-resource request?
+        → non-resource policy (§6.5)                  → 403 unless allowlisted
+  6. universal denylist (§6.3)                        → 403
+  7. mode policy (§6.4)                               → 403 on deny
+  8. namespace scope (§6.6)                           → 403 on out-of-scope
+  9. rewrite URL scheme+host → upstream
+     if mode == ro-nosecret: force JSON in Accept (§7.3)
+ 10. forward via client-go transport
+     ── host credentials injected HERE and nowhere else
+ 11. response:
+        discovery path  → filter (§6.7)
+        ro-nosecret     → redact stream (§7)
+ 12. audit line
+```
+
+Steps 6–8 are ordered cheapest-first and each can only ever *deny*; none can
+re-permit something an earlier step rejected.
+
+**Streaming.** `FlushInterval = -1` on the reverse proxy so `watch` and `logs
+--follow` stream rather than buffer. Requests whose parsed verb is `watch`, or
+which target `pods/log` with `follow=true`, get no response deadline; all others
+get one.
+
+## 5. Rule model
+
+Rules are RBAC-shaped:
+
+```yaml
+- apiGroups: ["", "apps"]      # "" is the core group
+  resources: ["pods", "pods/log", "deployments"]
+  verbs: ["get", "list", "watch"]
+```
+
+Matcher semantics, deliberately mirroring Kubernetes RBAC:
+
+- `*` matches any value within its field.
+- Subresources are named as `resource/subresource`.
+- **A rule for `pods` does not grant `pods/log`, `pods/exec`, or any other
+  subresource.** Subresources must be named explicitly.
+
+That last property is the reason to mirror RBAC rather than invent a scheme: it
+makes subresource handling fail-safe by construction instead of by vigilance.
+
+A rule set is evaluated as either an **allowlist** (deny unless some rule
+matches) or a **denylist** (allow unless some rule matches). Each mode composes
+these differently.
+
+## 6. Policy
+
+### 6.1 Mode summary
+
+| Mode | Verbs | Resource policy | Redaction |
+|---|---|---|---|
+| `ro-nosecret` | `get, list, watch` | curated **allowlist**, fail closed | on |
+| `ro-secret` | `get, list, watch` | **denylist** | off |
+| `rw` | all | **denylist** | off |
+
+### 6.2 Why the strict mode fails closed and the others do not
+
+`ro-nosecret` is the only mode that makes a promise about *content*. A denylist
+cannot keep that promise, because the set of resources holding secret material is
+open-ended: `ExternalSecret`, `SealedSecret`, `VaultStaticSecret`,
+`ClusterSecretStore`, and whatever an operator installs next week. Fail-closed is
+the only way the promise survives a cluster gaining a CRD.
+
+The other two modes already concede secret access, so a denylist costs nothing
+there and avoids blocking legitimate work on every unrecognized CRD.
+
+### 6.3 Universal denylist — all modes, not overridable
+
+Denied regardless of mode, and not grantable through `--policy`:
+
+- Any `*/exec`, `*/attach`, `*/portforward`, or `*/proxy` subresource. This
+  covers `pods/exec`, `pods/attach`, `pods/portforward`, `pods/proxy`,
+  `services/proxy`, and `nodes/proxy`.
+- `serviceaccounts/token`.
+- Any request carrying `Connection: Upgrade`, rejected at step 2 before parsing.
+
+Because interactive subresources are denied everywhere, `kubegate` never
+implements SPDY or WebSocket protocol upgrade forwarding at all. A whole class of
+proxying bugs is designed out rather than guarded against.
+
+### 6.4 Mode rule sets
+
+#### `ro-nosecret` — allowlist
+
+Verb gate: `get`, `list`, `watch`. Then:
+
+| Group | Resources |
+|---|---|
+| core `""` | `pods`, `pods/status`, `pods/log`, `services`, `endpoints`, `configmaps`, `namespaces`, `nodes`, `nodes/status`, `events`, `persistentvolumes`, `persistentvolumeclaims`, `replicationcontrollers`, `serviceaccounts`, `limitranges`, `resourcequotas` |
+| `apps` | `deployments`, `deployments/status`, `replicasets`, `statefulsets`, `daemonsets`, `controllerrevisions` |
+| `batch` | `jobs`, `cronjobs` |
+| `networking.k8s.io` | `ingresses`, `ingressclasses`, `networkpolicies` |
+| `discovery.k8s.io` | `endpointslices` |
+| `autoscaling` | `horizontalpodautoscalers` |
+| `policy` | `poddisruptionbudgets` |
+| `storage.k8s.io` | `storageclasses`, `csidrivers`, `csinodes`, `volumeattachments` |
+| `scheduling.k8s.io` | `priorityclasses` |
+| `node.k8s.io` | `runtimeclasses` |
+| `coordination.k8s.io` | `leases` |
+| `metrics.k8s.io` | `pods`, `nodes` (so `kubectl top` works) |
+| `apiextensions.k8s.io` | `customresourcedefinitions` — the *schemas*, never instances |
+
+Deliberately absent, and denied by the fail-closed default: `secrets`, all of
+`rbac.authorization.k8s.io`, `certificates.k8s.io`,
+`admissionregistration.k8s.io`, the `*Review` authorization APIs, and every CRD
+instance until opted in.
+
+#### `ro-secret` — denylist
+
+Verb gate: `get`, `list`, `watch`. Denied: the universal denylist only.
+Everything else is permitted, `secrets` and RBAC objects included.
+
+#### `rw` — denylist
+
+All verbs. Denied: the universal denylist, plus
+
+- `certificatesigningrequests` (all verbs)
+- `certificatesigningrequests/approval`
+
+Both mint credentials usable *outside* the proxy, which is a boundary escape
+rather than an escalation (§2). Everything else is permitted, including RBAC
+writes.
+
+### 6.5 Non-resource paths
+
+Allowed in all modes — `kubectl` is unusable without them:
+
+`/version`, `/api`, `/api/v1`, `/apis`, `/apis/<group>`,
+`/apis/<group>/<version>`, `/openapi/v2`, `/openapi/v3`, `/openapi/v3/*`
+
+Everything else is denied, notably `/logs`, `/debug/*`, `/metrics`, `/healthz`,
+`/readyz`, `/livez`, `/.well-known/openid-configuration`, and `/openid/v1/jwks`.
+
+OpenAPI documents pass through unfiltered in every mode. They leak the *names* of
+types, never instance data, and `kubectl explain` and `apply` need them intact.
+Filtering them is not worth the fidelity risk.
+
+### 6.6 Namespace scope
+
+When `--namespace` is set:
+
+- Namespaced requests must target a listed namespace.
+- **Cluster-wide collection requests are denied**, not fanned out. `GET
+  /api/v1/pods` returns 403 with a message telling the caller to name a
+  namespace. Fanning out would mean synthesizing list responses and merging watch
+  streams, with resource-version semantics we cannot honestly reproduce.
+- Cluster-scoped resources permitted by the mode remain readable. `--namespace`
+  narrows namespaced access; it does not imply "nothing cluster-scoped".
+
+When `--namespace` is unset, no namespace constraint applies.
+
+### 6.7 Discovery filtering
+
+In `ro-nosecret` only, `APIResourceList` responses are rewritten to contain just
+the allowlisted resources, and `APIGroupList` to just the groups retaining at
+least one resource. `kubectl api-resources` then shows exactly what works, which
+turns a confusing 403 into an absence.
+
+The other two modes pass discovery through untouched.
+
+### 6.8 The `--policy` extension file
+
+`--policy` extends the `ro-nosecret` allowlist — typically to admit an
+application's own CRDs. It is ignored in the two denylist modes, where it would
+mean nothing.
+
+```yaml
+# extends the ro-nosecret allowlist; cannot subtract from it
+rules:
+  - apiGroups: ["example.com"]
+    resources: ["widgets", "widgets/status"]
+    verbs: ["get", "list", "watch"]
+```
+
+Validated at load; **any violation is a startup failure, not a warning**, so a
+malformed policy can never quietly widen access:
+
+- `apiGroups` and `resources` must be literal. `*` is rejected — a wildcard would
+  defeat the fail-closed property that is the entire point of the mode.
+- `verbs` may only be `get`, `list`, or `watch`, matching the mode's verb gate.
+- No rule may name `secrets`, any resource in `rbac.authorization.k8s.io` or
+  `certificates.k8s.io`, or anything on the universal denylist (§6.3).
+
+The file can only ever add resources to a single mode's allowlist. It cannot
+change the verb gate, disable redaction, widen namespace scope, or override the
+universal denylist.
+
+## 7. Redaction (`ro-nosecret` only)
+
+### 7.1 What is stripped
+
+- `data` and `stringData`, on every kind **except `ConfigMap`**. A ConfigMap's
+  `data` is the entire reason to read one; stripping it would gut an allowed
+  resource. `Secret` is already denied by the allowlist, so this is
+  defense-in-depth against secret-shaped fields on other kinds.
+- The `kubectl.kubernetes.io/last-applied-configuration` annotation. This is the
+  load-bearing redaction: it routinely embeds the full submitted manifest,
+  including literal `env` values, on objects the mode legitimately allows.
+
+`env[].value` is **not** stripped, per an explicit decision: it catches accidental
+leaks without mangling pod specs that clients read for legitimate reasons. A
+password typed directly into a manifest's `env` remains visible. This is the
+sharpest edge of the mode and is stated plainly in §2.
+
+### 7.2 Where it applies
+
+- Single objects.
+- `List` responses — every element of `items`.
+- Watch streams — every frame's `object`, transformed independently as frames
+  arrive, without buffering the stream.
+- `metav1.Table` responses — the embedded `object` of every row.
+
+### 7.3 Content negotiation
+
+In `ro-nosecret`, `application/vnd.kubernetes.protobuf` is stripped from the
+inbound `Accept` header before forwarding, forcing a JSON-family response.
+Redacting protobuf bodies would require the full scheme and is not worth it. If a
+client accepts *only* protobuf, the proxy returns `406 Not Acceptable` with a
+`metav1.Status` explaining why. `kubectl` is unaffected — it uses JSON, including
+for its `as=Table` requests.
+
+### 7.4 Failure behavior
+
+If a response body cannot be parsed as expected, the proxy **aborts the response
+with 500** and logs it. It never forwards bytes it could not transform. For an
+already-streaming watch, the connection is closed. Failing open here would
+silently void the mode's guarantee.
+
+## 8. Credentials, TLS, and tokens
+
+### 8.1 Upstream credentials
+
+`clientcmd` loads the kubeconfig and selects `--context`; `rest.TransportFor`
+builds the `RoundTripper`. This gives exec-plugin invocation, bearer tokens,
+client certificates, token file reloading, refresh-before-expiry, `proxy-url`,
+and TLS/SNI configuration without writing any of it.
+
+The proxy never reads, logs, or echoes credential material. It holds a
+`RoundTripper`, not a token.
+
+### 8.2 Listener TLS
+
+On first run the proxy generates a self-signed certificate and key into
+`--tls-dir` with mode `0600`, and reuses them afterwards. SANs are the
+`--listen` IP or host, plus any `--tls-san` values. The CA is printed in PEM at
+startup for pinning as `certificate-authority-data` in the guest.
+
+Pinning matters: without it, anything on the shared network segment can present
+its own certificate, harvest the bearer token, and hold the whole capability.
+
+### 8.3 Proxy token
+
+32 bytes from `crypto/rand`, base64url-encoded, persisted to `--token-file` at
+`0600` so restarts do not invalidate the guest's kubeconfig. `--rotate-token`
+regenerates it. Comparison is `crypto/subtle.ConstantTimeCompare`.
+
+The token is proxy-scoped: it authorizes nothing but this process, in this mode,
+against this context, and revoking it is deleting a file.
+
+### 8.4 Inbound header scrubbing
+
+`Authorization`, `Impersonate-User`, `Impersonate-Group`, `Impersonate-Uid`,
+`Impersonate-Extra-*`, and `X-Remote-*` are removed from every request after
+authentication and are never forwarded. A client that sets them is not rejected —
+they are simply erased, so impersonation cannot be smuggled through even if the
+host identity is permitted to impersonate.
+
+## 9. Error handling
+
+**The governing rule: never fail open.**
+
+| Situation | Response |
+|---|---|
+| Policy denial | `403` + `metav1.Status` naming resource and mode |
+| Missing or bad token | `401` + `metav1.Status` |
+| Protobuf-only `Accept` in `ro-nosecret` | `406` + `metav1.Status` |
+| Host credentials unavailable or expired | `503`, message: *host credentials unavailable for context `X`; re-run your login on the host* |
+| Upstream unreachable | `502` |
+| Upstream timeout (non-streaming) | `504` |
+| Redaction or parse failure | `500`, response aborted |
+| Write body over cap in `rw` | `413` |
+
+Denial messages name the resource and the mode but never the upstream URL or any
+credential detail. `kubectl` renders them as
+`Error from server (Forbidden): pods is forbidden: denied by kubegate policy (mode=ro-nosecret)`.
+
+**Startup validation.** Before binding the listener, the proxy issues `GET
+/version` upstream. Expired SSO is the most common real-world failure, and it
+should surface when the developer starts the proxy on the host, not when the
+guest runs its first command.
+
+**Body cap.** Write bodies in `rw` are capped at 8 MiB, comfortably above real
+manifests and below what would let a guest exhaust host memory.
+
+**Shutdown.** SIGINT/SIGTERM stops accepting, drains in-flight non-streaming
+requests, and closes streaming connections after a grace period.
+
+## 10. Audit log
+
+One JSON object per line, to `--audit-log` or stderr:
+
+```json
+{"ts":"2026-08-26T10:00:00Z","remote":"192.168.5.15:51234","method":"GET",
+ "path":"/api/v1/namespaces/app/secrets","verb":"list","group":"","version":"v1",
+ "resource":"secrets","subresource":"","namespace":"app","name":"",
+ "decision":"deny","reason":"resource not in ro-nosecret allowlist",
+ "mode":"ro-nosecret","context":"prod-eks","status":403,"bytes":142,
+ "duration_ms":1,"redacted":false}
+```
+
+Never logged: the token, request bodies, response bodies. Denials are logged at a
+level that surfaces by default — they are the interesting events.
+
+## 11. Guest setup
+
+The startup banner prints a paste-ready kubeconfig:
+
+```yaml
+apiVersion: v1
+kind: Config
+clusters:
+  - name: kubegate
+    cluster:
+      server: https://192.168.5.2:8443
+      certificate-authority-data: <base64 CA>
+users:
+  - name: kubegate
+    user:
+      token: <proxy token>
+contexts:
+  - name: kubegate
+    context: {cluster: kubegate, user: kubegate}
+current-context: kubegate
+```
+
+No cluster credential appears anywhere in it, and there is exactly one cluster
+entry, so the guest cannot address anything else.
+
+## 12. Testing strategy
+
+Three layers. TDD order follows the dependency graph: policy matcher → `reqinfo`
+→ redaction → server wiring → integration → e2e.
+
+### 12.1 Unit tests
+
+**`internal/policy` is the heart of the project.** It is pure, so exhaustiveness
+is nearly free, and it is where a bypass would hide. Table-driven over
+`(mode, method, path, query) → allow | deny`, including these adversarial rows:
+
+```
+/api/v1/watch/secrets                                legacy watch prefix
+/api/v1/namespaces/x/pods/y/exec                     subresource escape
+/api/v1/namespaces/x/pods/y/attach
+/api/v1/namespaces/x/pods/y/portforward
+/api/v1/namespaces/x/pods/y/proxy/foo
+/api/v1/namespaces/x/services/y/proxy/foo
+/api/v1/nodes/n/proxy/foo
+//api/v1//secrets                                    double slashes
+/api/v1/namespaces/x/secrets/na%2Fme                 percent-encoded separator
+/api/v1/pods?watch=true                              vs. the /watch/ form
+/api/v1/namespaces/x/serviceaccounts/y/token         POST — rw escape
+.../certificatesigningrequests/c/approval            PUT  — rw escape
+/apis/external-secrets.io/v1beta1/externalsecrets    unknown secret CRD → deny
+/apis/bitnami.com/v1alpha1/sealedsecrets             unknown secret CRD → deny
+/apis/example.com/v1/widgets                         unknown CRD       → deny
+/apis/rbac.authorization.k8s.io/v1/clusterrolebindings
+/api/v1/pods                                         cluster-wide, --namespace set
+/api/v1/namespaces/other/pods                        namespace mismatch
+/logs  /debug/pprof/  /metrics  /openapi/v3          non-resource paths
+HEAD, OPTIONS                                        unusual methods
+```
+
+**`internal/redact`**: `Secret.data` stripped; **`ConfigMap.data` preserved**
+(the regression most likely to be introduced); last-applied annotation stripped
+from a Deployment; `env[].value` retained; `List` bodies; newline-delimited watch
+frames transformed without buffering; `Table` row objects; malformed JSON
+produces an error rather than passthrough.
+
+**`internal/authn`**: `Impersonate-*`, `X-Remote-*`, and client `Authorization`
+absent from the forwarded request.
+
+### 12.2 Integration tests — `envtest`
+
+Real apiserver and etcd binaries, no cluster. Fast, hermetic, and able to cover
+what k3d cannot conveniently reach:
+
+- The full middleware chain against a real apiserver's URL shapes and discovery.
+- **Exec-plugin credential path**, which k3d's static kubeconfig does not
+  exercise. A shell script emits envtest's admin credentials as an
+  `ExecCredential` — using `clientCertificateData`/`clientKeyData` rather than a
+  bearer token, since envtest's service-account token support varies by version
+  and we do not want the test's validity to depend on it. A short
+  `expirationTimestamp` plus a script that records its invocations proves
+  `kubegate` calls the plugin and refreshes on expiry.
+- Discovery filtering, by installing a CRD and asserting it is absent from
+  `ro-nosecret` discovery output and present in `ro-secret`.
+
+### 12.3 End-to-end tests — k3d
+
+A real cluster and a real `kubectl`, driven through the proxy. This is the layer
+that proves the promises in a way unit tests cannot.
+
+**Harness.** `test/e2e`, guarded by build tag `e2e` and skipped unless
+`KUBEGATE_E2E=1`, since it requires Docker.
+
+```
+k3d cluster create kubegate-e2e --agents 1 --image rancher/k3s:v1.31.5-k3s1
+```
+
+k3d v5.5.0 defaults to k3s v1.26.4, which is old enough to miss current API
+shapes, so the image is pinned explicitly. The k3d-written kubeconfig is the
+*host* kubeconfig; the proxy binds `127.0.0.1` (the VM-facing interface is not
+needed to test policy).
+
+**Fixtures**, seeded before the modes run:
+
+- namespaces `app` and `other`
+- a `Secret` and a `ConfigMap` in each
+- a `Deployment` created with `kubectl apply` — so a real
+  `last-applied-configuration` annotation exists — carrying a literal `env` value
+- a dummy CRD `widgets.example.com` plus one instance, standing in for a
+  secret-bearing operator CRD
+
+**Assertion matrix.** For each mode, a fresh proxy process and a generated guest
+kubeconfig, driving the real `kubectl`:
+
+| Check | `ro-nosecret` | `ro-secret` | `rw` |
+|---|---|---|---|
+| `get pods` | ✅ | ✅ | ✅ |
+| `get configmap -o yaml` → `data` present | ✅ | ✅ | ✅ |
+| `get secrets` | ❌ 403 | ✅ | ✅ |
+| `get widgets` (unknown CRD) | ❌ 403 | ✅ | ✅ |
+| `get deploy -o yaml` → last-applied annotation | absent | present | present |
+| `api-resources` lists `secrets` | ❌ | ✅ | ✅ |
+| `exec` into a pod | ❌ 403 | ❌ 403 | ❌ 403 |
+| `port-forward` | ❌ 403 | ❌ 403 | ❌ 403 |
+| `create token <sa>` | ❌ 403 | ❌ 403 | ❌ 403 |
+| `delete pod` | ❌ 403 | ❌ 403 | ✅ |
+| `apply -f deployment.yaml` | ❌ 403 | ❌ 403 | ✅ |
+| `create clusterrolebinding` | ❌ 403 | ❌ 403 | ✅ |
+| `get pods -A` with `--namespace app` | ❌ 403 | ❌ 403 | ❌ 403 |
+| `get pods -n other` with `--namespace app` | ❌ 403 | ❌ 403 | ❌ 403 |
+| `get pods -w` streams | ✅ | ✅ | ✅ |
+| `logs` | ✅ | ✅ | ✅ |
+| `top pods` | ✅ | ✅ | ✅ |
+
+`top pods` relies on the metrics-server that k3s bundles, which becomes ready
+some seconds after the cluster does. The harness polls
+`/apis/metrics.k8s.io/v1beta1` until it answers before asserting, rather than
+racing it.
+
+Plus, independent of mode:
+
+- request with a wrong token → 401; with no token → 401
+- request over plain HTTP to the TLS port → connection failure, not a downgrade
+- `Connection: Upgrade` on an otherwise-allowed path → 403
+- **A discovery-walk coverage test**: enumerate every resource the live cluster
+  advertises and assert each receives an *explicit* decision. This is what
+  catches accidental fall-through when a real cluster grows a CRD, and it is the
+  single highest-value test in the suite for the fail-closed guarantee.
+
+Teardown deletes the cluster. CI-safe: one cluster per run, unique name.
+
+### 12.4 Make targets
+
+```
+make test              # unit only, no Docker, seconds
+make test-integration  # envtest
+make test-e2e          # k3d, KUBEGATE_E2E=1
+make test-all
+```
+
+## 13. Out of scope for v1
+
+Recorded so they are recognizably deferred rather than forgotten:
+
+- Multiple contexts or modes in one process; path-prefix cluster routing.
+- Per-client identity via mTLS, and per-token modes.
+- Request-body inspection (would close the legacy SA-token-Secret gap in §2).
+- Rate limiting and per-client quotas.
+- Service installation (`launchd`), auto-writing the guest kubeconfig into a
+  shared mount.
+- Protocol-upgrade forwarding for `exec`/`attach`/`port-forward`. This is a
+  deliberate permanent exclusion, not a deferral: it is what lets the design omit
+  SPDY and WebSocket handling entirely.
