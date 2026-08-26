@@ -73,6 +73,13 @@ func universalDenyDecision(req Request) Decision {
 	if req.Verb == "" {
 		return Decision{Reason: "request has no recognizable Kubernetes verb"}
 	}
+	// A resource request with an empty Resource field is malformed and
+	// indicates the parser could not identify a resource type. This can occur
+	// with malformed URLs like //api/v1//secrets. Such requests cannot be
+	// forwarded as they do not identify what to operate on.
+	if req.IsResourceRequest && req.Resource == "" {
+		return Decision{Reason: "request has no recognizable resource type"}
+	}
 	if universalDenyRules.Matches(req) {
 		return Decision{Reason: fmt.Sprintf("%s is never forwarded by kubegate", resourceDesc(req))}
 	}

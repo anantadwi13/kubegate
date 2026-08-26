@@ -39,6 +39,8 @@ func TestUniversalDeny(t *testing.T) {
 		{"legacy proxy on services", Request{Resource: "services", Verb: "proxy"}},
 		// OPTIONS and friends parse to an empty verb.
 		{"empty verb", Request{Resource: "pods", Verb: ""}},
+		// Malformed resource request with no identifiable resource type.
+		{"malformed empty resource", Request{IsResourceRequest: true, Resource: "", Verb: "get"}},
 	}
 	for _, tc := range denied {
 		t.Run(tc.name, func(t *testing.T) {
