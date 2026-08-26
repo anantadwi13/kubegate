@@ -18,6 +18,11 @@ type RuleSet []Rule
 
 // Matches reports whether this rule covers req.
 func (r Rule) Matches(req Request) bool {
+	// Empty Verb is always rejected: it indicates an unrecognized HTTP method.
+	// This is a defense-in-depth guarantee independent of the rule's Verbs list.
+	if req.Verb == "" {
+		return false
+	}
 	return matchAny(r.APIGroups, req.APIGroup) &&
 		matchAny(r.Verbs, req.Verb) &&
 		r.matchesResource(req.Resource, req.Subresource)
@@ -33,9 +38,10 @@ func (rs RuleSet) Matches(req Request) bool {
 	return false
 }
 
-// matchAny reports whether want appears in list, honouring "*". An empty
-// want matches only if "" is explicitly in the list, which prevents empty
-// Verb values from matching while allowing "" (core API group) to match.
+// matchAny reports whether want appears in list, honouring "*".
+// It uses simple equality: "" matches "" if explicitly listed, and "*" matches anything.
+// Note: the explicit Rule.Matches check for empty Verb ensures requests with Verb == ""
+// are always denied, regardless of what is listed in Verbs (defense-in-depth).
 func matchAny(list []string, want string) bool {
 	for _, got := range list {
 		if got == "*" {

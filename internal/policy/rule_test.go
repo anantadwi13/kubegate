@@ -71,6 +71,14 @@ func TestRuleMatches(t *testing.T) {
 			req:  Request{APIGroup: "", Resource: "pods", Verb: ""},
 			want: false,
 		},
+		{
+			// Regression test: defense-in-depth guarantee that empty Verb is always denied,
+			// even if a pathological rule explicitly lists "" in Verbs.
+			name: "pathological empty verb in Verbs list is still denied",
+			rule: Rule{APIGroups: []string{"*"}, Resources: []string{"*"}, Verbs: []string{""}},
+			req:  Request{APIGroup: "", Resource: "pods", Verb: ""},
+			want: false,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
