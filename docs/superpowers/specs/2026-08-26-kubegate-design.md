@@ -182,6 +182,20 @@ versus grouped `/apis`, and non-resource paths are exactly where an authorizatio
 bypass hides. `RequestInfoFactory` is the code the apiserver itself trusts for
 this.
 
+Using the apiserver's parser does not absolve us of understanding it. Its exact
+behavior on adversarial input was measured against v0.36.4, and three results
+directly shape the policy:
+
+| Request | Parses to | Consequence |
+|---|---|---|
+| `GET /api/v1/proxy/namespaces/x/pods/y/foo` | `verb=proxy`, `resource=pods`, **`subresource=""`** | A `*/proxy` subresource denylist misses it. Hence the `Verb == "proxy"` rule in §6.3. |
+| `OPTIONS /api/v1/namespaces/x/pods` | **`verb=""`**, `resource=pods` | Empty verb must be denied explicitly (§6.3). |
+| `GET //api/v1//secrets` | **`isResourceRequest=false`** | `splitPath` trims and splits, so the leading empty segment fails the `APIPrefixes` check. It is denied *as a non-resource path*, which is only safe because §6.5 is an exact-match allowlist. |
+| `GET /api/v1/namespaces/x/secrets/na%2Fme` | `resource=secrets`, `name=na`, `subresource=me` | Percent-decoding can only *create* a subresource, never hide one, so it cannot evade a subresource denial. |
+
+The third row is the one to keep in mind during any future refactor: making the
+non-resource policy permissive would turn a double-slash into a bypass.
+
 ## 4. Request lifecycle
 
 ```
@@ -269,6 +283,18 @@ Denied regardless of mode, and not grantable through `--policy`:
 - Any `*/exec`, `*/attach`, `*/portforward`, or `*/proxy` subresource. This
   covers `pods/exec`, `pods/attach`, `pods/portforward`, `pods/proxy`,
   `services/proxy`, and `nodes/proxy`.
+- **`Verb == "proxy"`.** This is not the same check as the one above, and omitting
+  it is a bypass. `RequestInfoFactory` treats `proxy` and `watch` as *special
+  verbs* expressible as a path prefix, so the legacy form
+  `GET /api/v1/proxy/namespaces/x/pods/y/foo` parses to
+  `{Verb: "proxy", Resource: "pods", Subresource: ""}` — **no subresource at
+  all**. A denylist keyed only on `*/proxy` would wave it straight through.
+  Verified against `k8s.io/apiserver` v0.36.4.
+- **`Verb == ""`.** Methods outside the known set (`OPTIONS`, `TRACE`, and
+  anything exotic) parse to an *empty* verb on a resource path — e.g.
+  `OPTIONS /api/v1/namespaces/x/pods` yields `{Verb: "", Resource: "pods"}`. An
+  empty verb matches no allowlist rule, but it must be denied explicitly rather
+  than incidentally, so a future denylist-shaped refactor cannot let it through.
 - `serviceaccounts/token`.
 - **Write verbs** (`create`, `update`, `patch`, `delete`, `deletecollection`) on
   `certificatesigningrequests`, and **all verbs** on
@@ -617,6 +643,9 @@ is nearly free, and it is where a bypass would hide. Table-driven over
 /api/v1/namespaces/x/pods/y/proxy/foo
 /api/v1/namespaces/x/services/y/proxy/foo
 /api/v1/nodes/n/proxy/foo
+/api/v1/proxy/namespaces/x/pods/y/foo               legacy verb-via-path proxy;
+                                                    verb=proxy, NO subresource
+OPTIONS /api/v1/namespaces/x/pods                   empty verb → deny
 //api/v1//secrets                                    double slashes
 /api/v1/namespaces/x/secrets/na%2Fme                 percent-encoded separator
 /api/v1/pods?watch=true                              vs. the /watch/ form
