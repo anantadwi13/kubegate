@@ -27,6 +27,12 @@ func LoadOrCreateToken(path string, rotate bool) (string, error) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return "", fmt.Errorf("creating token directory: %w", err)
 		}
+		// MkdirAll only applies the mode to components it actually creates,
+		// so a pre-existing (or since-loosened) directory would otherwise
+		// keep whatever mode it already had; tighten it explicitly.
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return "", fmt.Errorf("securing token directory: %w", err)
+		}
 	}
 
 	if !rotate {

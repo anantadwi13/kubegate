@@ -95,6 +95,43 @@ func TestLoadOrCreateTokenTightensStalePermissions(t *testing.T) {
 	}
 }
 
+func TestLoadOrCreateTokenTightensStaleDirPermissions(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "sub")
+	// Simulate the token's directory pre-existing (e.g. from something else,
+	// or loosened between runs) with a looser mode than we'd ever create it
+	// with ourselves.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "token")
+
+	if _, err := LoadOrCreateToken(p, false); err != nil {
+		t.Fatal(err)
+	}
+	di, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := di.Mode().Perm(); perm != 0o700 {
+		t.Errorf("directory mode after create = %o, want 700; a stale over-permissive directory must not silently persist", perm)
+	}
+
+	// Loosen it again and confirm the reuse path also tightens it.
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOrCreateToken(p, false); err != nil {
+		t.Fatal(err)
+	}
+	di, err = os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := di.Mode().Perm(); perm != 0o700 {
+		t.Errorf("directory mode after reuse = %o, want 700; a stale over-permissive directory must not silently persist", perm)
+	}
+}
+
 func TestTokensAreDistinct(t *testing.T) {
 	seen := map[string]bool{}
 	for i := 0; i < 50; i++ {
