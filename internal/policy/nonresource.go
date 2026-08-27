@@ -19,11 +19,16 @@ var nonResourceAllowExact = map[string]bool{
 
 // nonResourceDecision authorizes a non-resource request by exact match.
 //
-// This is an allowlist and must stay one. The spec records that
-// "//api/v1//secrets" fails the apiserver parser's APIPrefixes check and so
-// arrives here rather than at the resource policy; loosening this function
-// into prefix or cleaned-path matching would turn a doubled slash into an
-// authorization bypass.
+// This is an allowlist and must stay one -- but not because of
+// "//api/v1//secrets". That path was measured against the real
+// RequestInfoFactory (v0.36.4) and does NOT fail the APIPrefixes check or
+// arrive here: splitPath's doubled slash produces an empty path segment
+// that becomes an empty Resource field, so it parses to a RESOURCE request
+// (IsResourceRequest = true, Resource = ""). It is denied by
+// universalDenyDecision's explicit Resource == "" check (modes.go), never
+// reaching the non-resource policy at all. Loosening this function into
+// prefix or cleaned-path matching is still exactly the kind of change that
+// invites an authorization bypass -- it just isn't this particular path.
 func nonResourceDecision(path string) Decision {
 	if nonResourceAllowExact[path] {
 		return Allowed()

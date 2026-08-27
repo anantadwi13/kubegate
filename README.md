@@ -35,8 +35,11 @@ means starting a second process on a different port.
 `ro-nosecret` is the only mode that makes a promise about response *content*:
 it strips `kubectl.kubernetes.io/last-applied-configuration` (which can carry
 literal secret values from `kubectl apply`) and advertises only its allowlist
-via discovery, so `kubectl api-resources` shows exactly what works instead of
-a confusing 403. The other two modes serve everything they advertise.
+via the `/api` and `/apis` discovery documents, so `kubectl api-resources`
+shows exactly what works instead of a confusing 403. The other two modes
+serve everything they advertise. This discovery filtering is partial, not a
+guarantee — see "What it does not provide" below for what still passes
+through `/openapi/v2` and `/openapi/v3/*` unfiltered in every mode.
 
 Some things are refused in **every** mode, regardless of `--policy`
 extensions: interactive subresources (`exec`, `attach`, `port-forward`,
@@ -121,6 +124,12 @@ and read the diff before committing it.
   readable even in `ro-nosecret`.
 - Closing the legacy `kubernetes.io/service-account-token` Secret path in
   `rw` mode, which would require request-body inspection on Secret writes.
+- Full discovery hiding: `/openapi/v2` and `/openapi/v3/*` are never
+  filtered, in any mode. They can reveal the existence and schema of
+  restricted resource types — including `Secret` and any installed
+  third-party CRDs — even in `ro-nosecret`. They never reveal actual secret
+  data or resource instances, only that the type exists and what its shape
+  is.
 
 ## Repository layout
 

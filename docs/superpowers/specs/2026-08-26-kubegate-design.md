@@ -190,11 +190,12 @@ directly shape the policy:
 |---|---|---|
 | `GET /api/v1/proxy/namespaces/x/pods/y/foo` | `verb=proxy`, `resource=pods`, **`subresource=""`** | A `*/proxy` subresource denylist misses it. Hence the `Verb == "proxy"` rule in §6.3. |
 | `OPTIONS /api/v1/namespaces/x/pods` | **`verb=""`**, `resource=pods` | Empty verb must be denied explicitly (§6.3). |
-| `GET //api/v1//secrets` | **`isResourceRequest=false`** | `splitPath` trims and splits, so the leading empty segment fails the `APIPrefixes` check. It is denied *as a non-resource path*, which is only safe because §6.5 is an exact-match allowlist. |
+| `GET //api/v1//secrets` | `isResourceRequest=true`, **`resource=""`** | `splitPath` trims and splits, so the doubled slash produces an empty path segment that becomes an empty `Resource` field -- this is a malformed RESOURCE request, not a non-resource path. It is denied by `universalDenyDecision`'s explicit `Resource == ""` check (§6.3), never reaching the non-resource policy at all. |
 | `GET /api/v1/namespaces/x/secrets/na%2Fme` | `resource=secrets`, `name=na`, `subresource=me` | Percent-decoding can only *create* a subresource, never hide one, so it cannot evade a subresource denial. |
 
-The third row is the one to keep in mind during any future refactor: making the
-non-resource policy permissive would turn a double-slash into a bypass.
+The third row is the one to keep in mind during any future refactor: removing
+the empty-`Resource` check in `universalDenyDecision` would turn a
+double-slash into a bypass.
 
 ## 4. Request lifecycle
 
@@ -501,12 +502,39 @@ sharpest edge of the mode and is stated plainly in §2.
 
 ### 7.3 Content negotiation
 
-In `ro-nosecret`, `application/vnd.kubernetes.protobuf` is stripped from the
-inbound `Accept` header before forwarding, forcing a JSON-family response.
-Redacting protobuf bodies would require the full scheme and is not worth it. If a
-client accepts *only* protobuf, the proxy returns `406 Not Acceptable` with a
-`metav1.Status` explaining why. `kubectl` is unaffected — it uses JSON, including
-for its `as=Table` requests.
+In `ro-nosecret`, the inbound `Accept` header is rewritten to an ALLOWLIST of
+JSON-family media types before forwarding — not a denylist that strips only
+protobuf. An earlier version of this proxy did exactly that: it stripped only
+`application/vnd.kubernetes.protobuf` and forwarded every other requested media
+type unchanged, which meant a client could ask for `application/yaml` and
+receive it untouched — routing the entire redaction/discovery-filtering
+pipeline around itself, since `modifyResponse` only transforms JSON bodies.
+
+The fix keeps only media types whose base type is `application/json`.
+Structured params survive intact — e.g.
+`application/json;as=Table;g=meta.k8s.io;v=v1`, which is exactly what
+`kubectl` sends for `-o wide`-shaped output — and a bare `*/*` or
+`application/*` wildcard is normalized to a concrete `application/json`
+rather than left as something the upstream is free to satisfy with a format
+this proxy cannot inspect. If nothing JSON-family survives (a client that
+accepts *only* protobuf, or *only* YAML), the proxy returns
+`406 Not Acceptable` with a `metav1.Status` explaining why, before the
+request is ever forwarded. `kubectl` is unaffected — it always lists
+`application/json` among its accepted types, including for its `as=Table`
+requests.
+
+As defense in depth, `modifyResponse` also fails closed (`500`) if a response
+this pipeline is actually meant to transform — a discovery document, or a
+genuine resource response (object/List/Table) — comes back with a non-JSON
+`Content-Type` anyway in `ro-nosecret`, e.g. if the Accept rewrite above were
+ever incomplete, or the upstream ignored it, rather than forwarding it
+unfiltered. Two deliberate exceptions: `pods/log`, because the kubelet
+ignores content negotiation for that subresource and always streams plain
+text in every mode; and the non-resource, non-discovery endpoints this proxy
+never filters regardless of mode (`/openapi/v2`, `/openapi/v3/*`, `/version`
+— see README "What it does not provide"), which are not guaranteed to be
+JSON even when JSON was requested — a real apiserver's `/openapi/v3` root
+index answers `text/plain` regardless of `Accept`.
 
 ### 7.4 Failure behavior
 
