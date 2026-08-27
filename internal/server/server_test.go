@@ -60,6 +60,26 @@ func jsonUpstream(t *testing.T, body string) *upstreamRecorder {
 	})
 }
 
+// negotiatingUpstream behaves like a real content-negotiating apiserver: it
+// serves yamlBody as application/yaml whenever the incoming Accept header
+// asks for YAML and does not also accept JSON, and jsonBody as
+// application/json otherwise. A fake upstream that always answers with
+// application/json (as jsonUpstream does) can never reproduce the
+// Accept-header bypass this proxy must close, because the bug is entirely
+// about what the upstream is asked for.
+func negotiatingUpstream(t *testing.T, jsonBody, yamlBody string) *upstreamRecorder {
+	return newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		accept := strings.ToLower(r.Header.Get("Accept"))
+		if strings.Contains(accept, "yaml") && !strings.Contains(accept, "json") {
+			w.Header().Set("Content-Type", "application/yaml")
+			_, _ = w.Write([]byte(yamlBody))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(jsonBody))
+	})
+}
+
 // harness builds a handler wired to a fake upstream.
 func harness(t *testing.T, mode policy.Mode, up *upstreamRecorder) http.Handler {
 	t.Helper()
@@ -447,6 +467,219 @@ func TestHandlerPreservesQueryString(t *testing.T) {
 	}
 	if seen.Query().Get("labelSelector") != "app=web" || seen.Query().Get("limit") != "5" {
 		t.Errorf("query not preserved: %q", seen.RawQuery)
+	}
+}
+
+// TestNegotiateJSONAllowlistsJSONFamily locks down negotiateJSON as an
+// ALLOWLIST rather than a denylist. The prior version stripped only
+// protobuf and forwarded every other requested media type -- including
+// application/yaml -- unchanged, which routed responses straight around the
+// redaction/discovery-filtering pipeline (modifyResponse only transforms
+// JSON bodies). Only entries whose base media type is application/json may
+// survive; everything else, known or not, must be dropped.
+func TestNegotiateJSONAllowlistsJSONFamily(t *testing.T) {
+	tests := []struct {
+		name     string
+		accept   string
+		wantOK   bool
+		wantKept string // substring that must survive
+		wantGone string // substring that must not survive
+	}{
+		{"empty defaults to json", "", true, "application/json", ""},
+		{"protobuf only is rejected", "application/vnd.kubernetes.protobuf", false, "", ""},
+		{"yaml only is rejected", "application/yaml", false, "", ""},
+		{"yaml dropped, json kept", "application/yaml, application/json", true, "application/json", "yaml"},
+		{"protobuf dropped, json kept", "application/vnd.kubernetes.protobuf, application/json", true, "application/json", "protobuf"},
+		{"table params survive", "application/json;as=Table;g=meta.k8s.io;v=v1, application/json", true, "as=Table", ""},
+		{"bare wildcard forced to json", "*/*", true, "application/json", "*/*"},
+		{"unknown type is rejected", "text/plain", false, "", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := http.Header{}
+			if tc.accept != "" {
+				h.Set("Accept", tc.accept)
+			}
+			ok := negotiateJSON(h)
+			if ok != tc.wantOK {
+				t.Fatalf("negotiateJSON(%q) ok = %v, want %v (Accept now %q)", tc.accept, ok, tc.wantOK, h.Get("Accept"))
+			}
+			if tc.wantKept != "" && !strings.Contains(h.Get("Accept"), tc.wantKept) {
+				t.Errorf("Accept = %q, want it to contain %q", h.Get("Accept"), tc.wantKept)
+			}
+			if tc.wantGone != "" && strings.Contains(strings.ToLower(h.Get("Accept")), tc.wantGone) {
+				t.Errorf("Accept = %q, must not contain %q", h.Get("Accept"), tc.wantGone)
+			}
+		})
+	}
+}
+
+// TestHandlerAcceptYAMLCannotLeakRedactedContent is the end-to-end
+// regression for the Accept-header bypass: a client asking for YAML must
+// never receive the unredacted representation of an object ro-nosecret
+// would otherwise redact.
+func TestHandlerAcceptYAMLCannotLeakRedactedContent(t *testing.T) {
+	jsonBody := `{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"web",` +
+		`"annotations":{"kubectl.kubernetes.io/last-applied-configuration":"{\"env\":\"hunter2\"}"}}}`
+	// A real apiserver would happily serve the identical secret-bearing
+	// content as YAML; this fake reproduces that so the test actually
+	// exercises the bypass rather than an upstream that never leaks.
+	yamlBody := "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  annotations:\n" +
+		"    kubectl.kubernetes.io/last-applied-configuration: '{\"env\":\"hunter2\"}'\n"
+
+	t.Run("pure yaml Accept is rejected outright", func(t *testing.T) {
+		up := negotiatingUpstream(t, jsonBody, yamlBody)
+		h := harness(t, policy.ModeRONoSecret, up)
+
+		r := httptest.NewRequest("GET", "/apis/apps/v1/namespaces/app/deployments/web", nil)
+		r.Header.Set("Authorization", "Bearer "+testToken)
+		r.Header.Set("Accept", "application/yaml")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+
+		if strings.Contains(rec.Body.String(), "hunter2") {
+			t.Fatalf("secret leaked via Accept: application/yaml: status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if rec.Code == http.StatusOK {
+			t.Errorf("a pure application/yaml Accept must not be silently satisfied with 200: body=%s", rec.Body.String())
+		}
+	})
+
+	t.Run("yaml with json fallback still gets redacted", func(t *testing.T) {
+		up := negotiatingUpstream(t, jsonBody, yamlBody)
+		h := harness(t, policy.ModeRONoSecret, up)
+
+		r := httptest.NewRequest("GET", "/apis/apps/v1/namespaces/app/deployments/web", nil)
+		r.Header.Set("Authorization", "Bearer "+testToken)
+		r.Header.Set("Accept", "application/yaml, application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+
+		if strings.Contains(rec.Body.String(), "hunter2") {
+			t.Fatalf("secret leaked via Accept: application/yaml, application/json: status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if strings.Contains(up.lastHeader.Get("Accept"), "yaml") {
+			t.Errorf("upstream must not have been asked for yaml: %q", up.lastHeader.Get("Accept"))
+		}
+		if rec.Code != http.StatusOK {
+			t.Errorf("json was still on offer; the request should have succeeded, got %d: %s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// TestHandlerAcceptYAMLCannotBypassDiscoveryFiltering is the discovery-path
+// analog: a doubly-defended request for YAML discovery must not surface
+// resources the mode's allowlist would otherwise hide.
+func TestHandlerAcceptYAMLCannotBypassDiscoveryFiltering(t *testing.T) {
+	jsonBody := `{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"v1","resources":[
+		{"name":"pods","namespaced":true,"kind":"Pod","verbs":["list"]},
+		{"name":"secrets","namespaced":true,"kind":"Secret","verbs":["list"]}]}`
+	yamlBody := "kind: APIResourceList\napiVersion: v1\ngroupVersion: v1\nresources:\n" +
+		"- {name: pods, namespaced: true, kind: Pod, verbs: [list]}\n" +
+		"- {name: secrets, namespaced: true, kind: Secret, verbs: [list]}\n"
+
+	up := negotiatingUpstream(t, jsonBody, yamlBody)
+	h := harness(t, policy.ModeRONoSecret, up)
+
+	r := httptest.NewRequest("GET", "/api/v1", nil)
+	r.Header.Set("Authorization", "Bearer "+testToken)
+	r.Header.Set("Accept", "application/yaml")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+
+	if strings.Contains(rec.Body.String(), "secrets") {
+		t.Fatalf("discovery leaked secrets via Accept: application/yaml: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Code == http.StatusOK {
+		t.Errorf("a pure application/yaml Accept for discovery must not be silently satisfied with 200: body=%s", rec.Body.String())
+	}
+}
+
+// TestHandlerFailsClosedOnUnexpectedNonJSONInStrictMode is the defense-in-
+// depth half of the Accept-header fix: even though negotiateJSON forces a
+// JSON-family Accept in ro-nosecret, modifyResponse must not silently
+// forward a response anyway if it somehow comes back non-JSON (upstream
+// ignored the header, or a future gap in the rewrite).
+func TestHandlerFailsClosedOnUnexpectedNonJSONInStrictMode(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("raw-unfiltered-hunter2"))
+	})
+	h := harness(t, policy.ModeRONoSecret, up)
+
+	rec := do(t, h, "GET", "/api/v1/namespaces/app/configmaps/cfg", true)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500 (fail closed)", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "hunter2") {
+		t.Error("unexpected non-JSON bytes must never reach the client")
+	}
+}
+
+// TestHandlerAllowsNonJSONPodLogInStrictMode guards against the hardening
+// above over-reaching: pods/log is unconditionally readable in every mode
+// (see spec §2) and the kubelet ignores content negotiation for it,
+// answering with plain text regardless of Accept. That must keep working in
+// ro-nosecret.
+func TestHandlerAllowsNonJSONPodLogInStrictMode(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("log line one\nlog line two\n"))
+	})
+	h := harness(t, policy.ModeRONoSecret, up)
+
+	rec := do(t, h, "GET", "/api/v1/namespaces/app/pods/web/log", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; pods/log must stay readable in ro-nosecret: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "log line one") {
+		t.Errorf("log body was mangled: %s", rec.Body.String())
+	}
+}
+
+// TestHandlerAllowsNonJSONOpenAPIInStrictMode guards the hardening in
+// TestHandlerFailsClosedOnUnexpectedNonJSONInStrictMode against
+// over-reaching: a real apiserver's /openapi/v3 root index answers
+// text/plain even when JSON was explicitly requested (observed against a
+// real envtest apiserver), and /openapi/v2, /openapi/v3/*, and /version are
+// never filtered in any mode regardless of content type (see README "What
+// it does not provide"). None of that may become a 500 in ro-nosecret.
+func TestHandlerAllowsNonJSONOpenAPIInStrictMode(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte(`{"paths":{}}`))
+	})
+	h := harness(t, policy.ModeRONoSecret, up)
+
+	rec := do(t, h, "GET", "/openapi/v3", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; /openapi/v3 is never filtered and may legitimately be non-JSON: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHandlerWatchQueryParamCannotBypassDiscoveryFiltering guards the second
+// critical finding: isWatch must key off the parsed policy.Request, not raw
+// client-controlled query parameters. Appending ?watch=true to a discovery
+// path used to force the response down the streaming path, which applies no
+// discovery filtering at all.
+func TestHandlerWatchQueryParamCannotBypassDiscoveryFiltering(t *testing.T) {
+	up := jsonUpstream(t, `{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"v1","resources":[
+		{"name":"pods","namespaced":true,"kind":"Pod","verbs":["list"]},
+		{"name":"secrets","namespaced":true,"kind":"Secret","verbs":["list"]}]}`)
+	h := harness(t, policy.ModeRONoSecret, up)
+
+	for _, target := range []string{"/api/v1?watch=true", "/api/v1?follow=true"} {
+		rec := do(t, h, "GET", target, true)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, body = %s", target, rec.Code, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), "secrets") {
+			t.Errorf("%s: discovery must not advertise secrets in strict mode, watch/follow query params must not bypass filtering: %s",
+				target, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "pods") {
+			t.Errorf("%s: discovery must still advertise pods: %s", target, rec.Body.String())
+		}
 	}
 }
 

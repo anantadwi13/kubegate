@@ -30,10 +30,6 @@ import (
 // should be truncated rather than buffered.
 const MaxBodyBytes = 8 << 20
 
-// protobufMediaType is what client-go asks for by default. Redacting it
-// would require the full scheme, so the strict mode negotiates it away.
-const protobufMediaType = "application/vnd.kubernetes.protobuf"
-
 // Options are the collaborators a handler needs. All are required.
 type Options struct {
 	Upstream *upstream.Upstream
@@ -160,6 +156,17 @@ type redactedKeyType struct{}
 
 var redactedKey = redactedKeyType{}
 
+// reqKey is the context key under which authorize stashes the already-
+// parsed policy.Request, so modifyResponse can route by policy-relevant
+// fields (verb, resource, subresource) instead of raw, client-controlled
+// query parameters on the outbound URL. Keying streaming-vs-buffered
+// routing off ?watch=/?follow= directly let a client force ANY response
+// (e.g. a discovery document) down the unfiltered streaming path just by
+// appending the query parameter to an unrelated URL.
+type reqKeyType struct{}
+
+var reqKey = reqKeyType{}
+
 // authorize runs the chain and, when everything passes, forwards. It returns
 // what it decided so the caller can audit it, along with whether the
 // response body was actually changed by redaction or discovery filtering
@@ -224,7 +231,9 @@ func (h *handler) authorize(w http.ResponseWriter, r *http.Request) (policy.Requ
 	// reads it back after the proxy round trip completes so the audit log
 	// reflects what really happened to this response, not a guess.
 	var changed atomic.Bool
-	r = r.WithContext(context.WithValue(r.Context(), redactedKey, &changed))
+	ctx := context.WithValue(r.Context(), redactedKey, &changed)
+	ctx = context.WithValue(ctx, reqKey, req)
+	r = r.WithContext(ctx)
 
 	h.proxy.ServeHTTP(w, r)
 	return req, policy.Allowed(), changed.Load()
@@ -232,10 +241,38 @@ func (h *handler) authorize(w http.ResponseWriter, r *http.Request) (policy.Requ
 
 // modifyResponse applies discovery filtering and redaction.
 func (h *handler) modifyResponse(resp *http.Response) error {
-	if !h.opts.Engine.RedactionEnabled() && !discovery.IsDiscoveryPath(resp.Request.URL.Path) {
+	isDiscovery := discovery.IsDiscoveryPath(resp.Request.URL.Path)
+	if !h.opts.Engine.RedactionEnabled() && !isDiscovery {
 		return nil
 	}
+
+	req, _ := resp.Request.Context().Value(reqKey).(policy.Request)
+
 	if !isJSON(resp.Header.Get("Content-Type")) {
+		// Only fail closed for responses this pipeline actually promises to
+		// transform: discovery documents, and genuine resource responses
+		// (objects/Lists/Tables, which is what redact.Body acts on).
+		// Non-resource, non-discovery endpoints -- /openapi/v2,
+		// /openapi/v3/*, /version -- are never filtered in any mode (see
+		// README "What it does not provide") and are not guaranteed to be
+		// JSON even when JSON was requested; a real apiserver's
+		// /openapi/v3 root index answers text/plain regardless of Accept.
+		// pods/log is the same story for a resource response: the kubelet
+		// ignores content negotiation for it and always streams plain
+		// text, in every mode.
+		expectsJSON := isDiscovery || (req.IsResourceRequest && !isPodLog(req))
+		if h.opts.Engine.RedactionEnabled() && expectsJSON {
+			// negotiateJSON forced a JSON-family Accept for this request
+			// precisely so the response would always be something we can
+			// inspect. Getting anything else back means either the
+			// upstream ignored that or the safeguard has a gap; either
+			// way, forwarding it unfiltered would silently void the
+			// mode's guarantee, so fail closed instead of passing it
+			// through (defense in depth alongside the Accept rewrite).
+			return &errRedaction{fmt.Errorf(
+				"expected a JSON-family response for %s, got Content-Type %q",
+				resp.Request.URL.Path, resp.Header.Get("Content-Type"))}
+		}
 		return nil
 	}
 
@@ -244,7 +281,13 @@ func (h *handler) modifyResponse(resp *http.Response) error {
 	// error, not whether any frame actually changed, so the audit flag is
 	// not set here: a watch response's Redacted stays false rather than
 	// claiming a certainty we do not have.
-	if isWatch(resp) {
+	//
+	// A discovery document is never watched in real Kubernetes, and its
+	// filtering must always run through the buffered path below: routing
+	// it into the streaming branch on a client-controlled ?watch=/?follow=
+	// query parameter would skip discovery filtering entirely, since
+	// redact.Stream only ever redacts a frame's "object" field.
+	if !isDiscovery && isWatch(req, resp.Request) {
 		if !h.opts.Engine.RedactionEnabled() {
 			return nil
 		}
@@ -270,7 +313,7 @@ func (h *handler) modifyResponse(resp *http.Response) error {
 
 	out := body
 	var changed bool
-	if discovery.IsDiscoveryPath(resp.Request.URL.Path) {
+	if isDiscovery {
 		filtered, filterChanged, ferr := discovery.FilterBody(h.opts.Engine, resp.Request.URL.Path, out)
 		if ferr != nil {
 			return &errRedaction{ferr}
@@ -315,20 +358,57 @@ func isJSON(contentType string) bool {
 	return strings.Contains(ct, "json")
 }
 
-func isWatch(resp *http.Response) bool {
-	q := resp.Request.URL.Query()
-	if v := q.Get("watch"); v != "" && v != "false" && v != "0" {
-		return true
-	}
-	if v := q.Get("follow"); v != "" && v != "false" && v != "0" {
-		return true
-	}
-	return strings.Contains(resp.Request.URL.Path, "/watch/")
+// isPodLog reports whether req targets the pods/log subresource, the one
+// subresource unconditionally readable in every mode (design spec §2) and
+// exempt from the JSON-family expectations the rest of this file enforces:
+// the kubelet ignores content negotiation for it and always streams plain
+// text.
+func isPodLog(req policy.Request) bool {
+	return req.Resource == "pods" && req.Subresource == "log"
 }
 
-// negotiateJSON removes protobuf from Accept, reporting whether a
-// JSON-family response is still possible. An Accept of protobuf only leaves
-// nothing we can redact.
+// isWatch reports whether resp should be streamed frame-by-frame rather
+// than buffered, keyed off the already-PARSED policy.Request rather than
+// raw, client-controlled query parameters on the request URL. Deciding this
+// from ?watch=/?follow= directly let a client force any response -- a
+// discovery document included -- down the streaming path, which applies no
+// discovery filtering at all.
+//
+// Per the design spec, this is: the parsed verb is "watch", or the request
+// targets pods/log with follow=true. "follow" is a kubelet-specific query
+// parameter RequestInfoFactory does not parse into the verb, so it is read
+// directly here, but only once req has already established (from the
+// authoritative parser) that this really is a pods/log request.
+func isWatch(req policy.Request, r *http.Request) bool {
+	if req.Verb == "watch" {
+		return true
+	}
+	if isPodLog(req) {
+		if v := r.URL.Query().Get("follow"); v != "" && v != "false" && v != "0" {
+			return true
+		}
+	}
+	return false
+}
+
+// negotiateJSON rewrites the outbound Accept header to an ALLOWLIST of
+// JSON-family media types, reporting whether a JSON-family response is
+// still possible.
+//
+// This used to be a denylist that stripped only protobuf and forwarded
+// everything else -- including "application/yaml" -- unchanged. Since
+// modifyResponse only redacts and discovery-filters JSON bodies (isJSON),
+// that let a client route any response around the entire filtering
+// pipeline just by asking for a media type nobody thought to denylist.
+// Allowlisting is the only version of this that cannot be bypassed that
+// way.
+//
+// A structured JSON media type survives intact, params and all -- e.g.
+// "application/json;as=Table;g=meta.k8s.io;v=v1", which is exactly what
+// kubectl sends for `-o wide`-shaped output (see design spec §7.3). A bare
+// wildcard ("*/*" or "application/*") is rewritten to a concrete
+// "application/json" rather than kept as-is, so the upstream is never left
+// free to choose a format this proxy cannot inspect.
 func negotiateJSON(h http.Header) bool {
 	raw := h.Get("Accept")
 	if raw == "" {
@@ -337,11 +417,20 @@ func negotiateJSON(h http.Header) bool {
 	}
 	var kept []string
 	for _, part := range strings.Split(raw, ",") {
-		if strings.Contains(strings.ToLower(part), protobufMediaType) {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
 			continue
 		}
-		if trimmed := strings.TrimSpace(part); trimmed != "" {
+		base, params, hasParams := strings.Cut(trimmed, ";")
+		switch strings.ToLower(strings.TrimSpace(base)) {
+		case "application/json":
 			kept = append(kept, trimmed)
+		case "*/*", "application/*":
+			if hasParams {
+				kept = append(kept, "application/json;"+params)
+			} else {
+				kept = append(kept, "application/json")
+			}
 		}
 	}
 	if len(kept) == 0 {
