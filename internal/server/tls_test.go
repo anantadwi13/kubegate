@@ -129,6 +129,38 @@ func TestLoadOrCreateCertTightensStaleKeyPermissions(t *testing.T) {
 	}
 }
 
+// TestLoadOrCreateCertTightensStaleKeyPermissionsOnRegeneration covers the
+// other half of the same os.WriteFile-mode gap as
+// TestLoadOrCreateTokenRotateTightensStalePermissions: if tls.key already
+// exists (e.g. left over-permissive by a previous run) but tls.crt is
+// missing, LoadOrCreateCert regenerates BOTH from scratch and overwrites
+// the existing key file -- but os.WriteFile only applies its mode argument
+// when creating a file, so an unguarded write here would silently keep
+// whatever looser permissions the stale key already had.
+func TestLoadOrCreateCertTightensStaleKeyPermissionsOnRegeneration(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "kubegate")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(dir, "tls.key")
+	// A stale, over-permissive key with no matching certificate: the
+	// generate-from-scratch branch, not the reuse branch, must run.
+	if err := os.WriteFile(keyPath, []byte("not a real key"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := LoadOrCreateCert(dir, "127.0.0.1:8443", nil); err != nil {
+		t.Fatal(err)
+	}
+	ki, err := os.Stat(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := ki.Mode().Perm(); perm != 0o600 {
+		t.Errorf("key mode after regeneration = %o, want 600; a stale over-permissive key must not silently persist", perm)
+	}
+}
+
 func TestLoadOrCreateCertHostnameListen(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "kubegate")
 	_, caPEM, err := LoadOrCreateCert(dir, "host.example.com:8443", nil)

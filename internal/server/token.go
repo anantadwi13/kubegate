@@ -61,5 +61,12 @@ func LoadOrCreateToken(path string, rotate bool) (string, error) {
 	if err := os.WriteFile(path, []byte(tok+"\n"), 0o600); err != nil {
 		return "", fmt.Errorf("writing token to %s: %w", path, err)
 	}
+	// os.WriteFile only applies its mode argument when CREATING a file; on
+	// --rotate-token this call overwrites a token file that already
+	// exists, so without an explicit chmod the rotated token could
+	// silently keep whatever looser permissions the old file had.
+	if err := os.Chmod(path, 0o600); err != nil {
+		return "", fmt.Errorf("securing token at %s: %w", path, err)
+	}
 	return tok, nil
 }

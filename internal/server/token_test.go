@@ -132,6 +132,33 @@ func TestLoadOrCreateTokenTightensStaleDirPermissions(t *testing.T) {
 	}
 }
 
+// TestLoadOrCreateTokenRotateTightensStalePermissions guards the rotate
+// path specifically: os.WriteFile only applies its mode argument when
+// CREATING a file. --rotate-token always rewrites an EXISTING token file,
+// so the reuse path's chmod fix does not run here and the file could keep
+// whatever looser permissions it already had.
+func TestLoadOrCreateTokenRotateTightensStalePermissions(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "token")
+	if _, err := LoadOrCreateToken(p, false); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a stale token file left over-permissive by a previous run or
+	// by external tampering, then rotate it.
+	if err := os.Chmod(p, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOrCreateToken(p, true); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("token mode after --rotate-token = %o, want 600; rotation must not silently keep a looser mode", perm)
+	}
+}
+
 func TestTokensAreDistinct(t *testing.T) {
 	seen := map[string]bool{}
 	for i := 0; i < 50; i++ {

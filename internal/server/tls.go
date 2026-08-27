@@ -65,6 +65,15 @@ func LoadOrCreateCert(dir, listenAddr string, extraSANs []string) (*tls.Certific
 	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
 		return nil, nil, fmt.Errorf("writing key: %w", err)
 	}
+	// os.WriteFile only applies its mode argument when CREATING a file.
+	// This branch runs whenever certPath is missing, regardless of whether
+	// keyPath already existed (e.g. only the certificate was deleted, or a
+	// previous run left a stale key behind); without an explicit chmod the
+	// regenerated key could silently keep whatever looser permissions the
+	// old file had.
+	if err := os.Chmod(keyPath, 0o600); err != nil {
+		return nil, nil, fmt.Errorf("securing key: %w", err)
+	}
 	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
 		return nil, nil, fmt.Errorf("writing certificate: %w", err)
 	}
