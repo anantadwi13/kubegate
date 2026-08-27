@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -695,6 +696,59 @@ func TestHandlerPassesThroughNonOKDiscoveryResponses(t *testing.T) {
 			t.Errorf("status = %d, want %d (a Status error body must not trip FilterBody's unrecognized-kind default)", rec.Code, http.StatusServiceUnavailable)
 		}
 	})
+}
+
+// TestHandlerStripsAcceptEncodingBeforeForwarding guards a regression found
+// live: `kubectl get pod -A` failed with a 500 ("kubegate could not process
+// the cluster response") while a smaller single-namespace list worked fine.
+//
+// kubectl's Go HTTP client sets its own Accept-Encoding header on every
+// outbound request. net/http's Transport only takes over compression
+// itself -- adding "Accept-Encoding: gzip" and transparently decompressing
+// the response -- when the outbound request has no Accept-Encoding header
+// at all. Forwarding the guest's header verbatim defeated that: a real
+// apiserver compresses responses over a size threshold (which -A's larger
+// body crosses and a small list may not), so kubegate received raw gzip
+// bytes with Content-Type: application/json, tried to JSON-decode them for
+// redaction, and failed closed -- masking a perfectly good response as a
+// generic 500.
+func TestHandlerStripsAcceptEncodingBeforeForwarding(t *testing.T) {
+	var compressed bytes.Buffer
+	gw := gzip.NewWriter(&compressed)
+	if _, err := gw.Write([]byte(`{"kind":"PodList","apiVersion":"v1","items":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	up := newUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write(compressed.Bytes())
+	})
+	h := harness(t, policy.ModeRONoSecret, up)
+
+	// A distinctive, non-negotiable value: net/http's Transport only ever
+	// adds "gzip" itself, so if this reaches the fake upstream verbatim,
+	// kubegate forwarded the guest's header instead of stripping it --
+	// which would disable the transport's transparent decompression and
+	// reproduce the bug.
+	r := httptest.NewRequest("GET", "/api/v1/pods", nil)
+	r.Header.Set("Authorization", "Bearer "+testToken)
+	r.Header.Set("Accept-Encoding", "br")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+
+	if up.lastHeader.Get("Accept-Encoding") == "br" {
+		t.Error("upstream saw the guest's Accept-Encoding verbatim: kubegate must strip it so net/http's transport manages compression itself")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"kind":"PodList"`) {
+		t.Errorf("body = %s, want the decompressed PodList", rec.Body.String())
+	}
 }
 
 // TestHandlerWatchQueryParamCannotBypassDiscoveryFiltering guards the second

@@ -62,6 +62,23 @@ func NewHandler(o Options) (http.Handler, error) {
 			r.Out.URL.Scheme = base.Scheme
 			r.Out.URL.Host = base.Host
 			r.Out.Host = base.Host
+
+			// Strip the client's own Accept-Encoding. net/http's Transport
+			// only takes over compression itself -- adding its own
+			// "Accept-Encoding: gzip" and transparently decompressing the
+			// response before handoff -- when the outbound request carries
+			// no Accept-Encoding header at all. Forwarding the guest's
+			// header verbatim (kubectl's Go HTTP client sets one on every
+			// request) defeats that: a real apiserver compresses large
+			// bodies (kubectl get pods -A easily crosses the size
+			// threshold; a small single-namespace list may not), and
+			// modifyResponse then tries to JSON-decode raw gzip bytes,
+			// fails, and fails closed with a 500 that has nothing to do
+			// with the actual response. Dropping the header restores the
+			// transport's own transparent handling, so resp.Body is
+			// always already the decompressed bytes modifyResponse
+			// expects.
+			r.Out.Header.Del("Accept-Encoding")
 		},
 		ModifyResponse: h.modifyResponse,
 		ErrorHandler:   writeProxyError,
