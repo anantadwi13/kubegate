@@ -657,6 +657,46 @@ func TestHandlerAllowsNonJSONOpenAPIInStrictMode(t *testing.T) {
 	}
 }
 
+// TestHandlerPassesThroughNonOKDiscoveryResponses guards a regression found
+// by running the full e2e suite against a real k3d cluster after the fixes
+// above landed: under API Priority and Fairness, a discovery-path request
+// can legitimately come back non-200 (observed: a rejected request
+// answered non-JSON) -- and a real apiserver error response is always kind
+// "Status", which FilterBody's kind switch does not recognize as a
+// discovery document. Both of the new fail-closed checks (the non-JSON
+// hardening and FilterBody's unrecognized-kind default) must not fire on a
+// non-200 response, or they replace the upstream's real status code with a
+// misleading 500.
+func TestHandlerPassesThroughNonOKDiscoveryResponses(t *testing.T) {
+	t.Run("non-JSON error status is forwarded, not fail-closed", func(t *testing.T) {
+		up := newUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("Too many requests, please try again later."))
+		})
+		h := harness(t, policy.ModeRONoSecret, up)
+
+		rec := do(t, h, "GET", "/api", true)
+		if rec.Code != http.StatusTooManyRequests {
+			t.Errorf("status = %d, want %d (the upstream's real status must survive)", rec.Code, http.StatusTooManyRequests)
+		}
+	})
+
+	t.Run("JSON Status error body is forwarded, not fail-closed", func(t *testing.T) {
+		up := newUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"ServiceUnavailable","code":503}`))
+		})
+		h := harness(t, policy.ModeRONoSecret, up)
+
+		rec := do(t, h, "GET", "/apis", true)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want %d (a Status error body must not trip FilterBody's unrecognized-kind default)", rec.Code, http.StatusServiceUnavailable)
+		}
+	})
+}
+
 // TestHandlerWatchQueryParamCannotBypassDiscoveryFiltering guards the second
 // critical finding: isWatch must key off the parsed policy.Request, not raw
 // client-controlled query parameters. Appending ?watch=true to a discovery

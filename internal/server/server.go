@@ -250,8 +250,17 @@ func (h *handler) modifyResponse(resp *http.Response) error {
 
 	if !isJSON(resp.Header.Get("Content-Type")) {
 		// Only fail closed for responses this pipeline actually promises to
-		// transform: discovery documents, and genuine resource responses
-		// (objects/Lists/Tables, which is what redact.Body acts on).
+		// transform: a successful discovery document, or a genuine
+		// resource response (objects/Lists/Tables, which is what
+		// redact.Body acts on) -- and only on 200, mirroring the
+		// redact.Body gate below. A non-200 response is an upstream error
+		// (rate limiting under API Priority and Fairness, a timeout, ...)
+		// and is not guaranteed to be JSON even at a discovery or resource
+		// path -- APF has been observed answering a rejected discovery
+		// request with a text/plain body. Treating that as "unexpected"
+		// would replace the upstream's real status (e.g. 429) with a
+		// misleading 500 fail-closed error.
+		//
 		// Non-resource, non-discovery endpoints -- /openapi/v2,
 		// /openapi/v3/*, /version -- are never filtered in any mode (see
 		// README "What it does not provide") and are not guaranteed to be
@@ -260,7 +269,8 @@ func (h *handler) modifyResponse(resp *http.Response) error {
 		// pods/log is the same story for a resource response: the kubelet
 		// ignores content negotiation for it and always streams plain
 		// text, in every mode.
-		expectsJSON := isDiscovery || (req.IsResourceRequest && !isPodLog(req))
+		expectsJSON := resp.StatusCode == http.StatusOK &&
+			(isDiscovery || (req.IsResourceRequest && !isPodLog(req)))
 		if h.opts.Engine.RedactionEnabled() && expectsJSON {
 			// negotiateJSON forced a JSON-family Accept for this request
 			// precisely so the response would always be something we can
@@ -313,7 +323,12 @@ func (h *handler) modifyResponse(resp *http.Response) error {
 
 	out := body
 	var changed bool
-	if isDiscovery {
+	// Only a successful discovery document is something FilterBody's kind
+	// switch understands. A non-200 response at a discovery path is an
+	// upstream error -- kind "Status", not one of the discovery kinds --
+	// and must pass through with its real status code rather than
+	// tripping FilterBody's fail-closed "unrecognized kind" default.
+	if isDiscovery && resp.StatusCode == http.StatusOK {
 		filtered, filterChanged, ferr := discovery.FilterBody(h.opts.Engine, resp.Request.URL.Path, out)
 		if ferr != nil {
 			return &errRedaction{ferr}
