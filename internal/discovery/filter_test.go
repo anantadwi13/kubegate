@@ -122,6 +122,51 @@ func TestFilterBodyMalformedIsAnError(t *testing.T) {
 	}
 }
 
+// TestFilterBodyPassesThroughAPIVersions guards the one deliberate
+// exception to TestFilterBodyRejectsUnrecognizedKind below: the bare /api
+// response (kind APIVersions) lists only server versions and address
+// CIDRs, never a resource type, so it must keep passing through rather
+// than tripping the fail-closed default -- a real apiserver serves exactly
+// this body for GET /api in every mode.
+func TestFilterBodyPassesThroughAPIVersions(t *testing.T) {
+	body := []byte(`{"kind":"APIVersions","versions":["v1"],"serverAddressByClientCIDRs":[{"clientCIDR":"0.0.0.0/0","serverAddress":"127.0.0.1:1"}]}`)
+	out, changed, err := FilterBody(engine(t, policy.ModeRONoSecret), "/api", body)
+	if err != nil {
+		t.Fatalf("APIVersions must not be treated as unrecognized: %v", err)
+	}
+	if changed {
+		t.Error("APIVersions has nothing to filter")
+	}
+	if string(out) != string(body) {
+		t.Error("APIVersions body must be returned unchanged")
+	}
+}
+
+// TestFilterBodyRejectsUnrecognizedKind guards the root cause behind the
+// real Aggregated-Discovery fail-open (see filterAggregatedDiscoveryList's
+// doc comment): FilterBody's default case used to return the ORIGINAL body
+// unfiltered for any discovery "kind" it did not specifically recognize.
+// That is exactly the shape that let APIGroupDiscoveryList leak "secrets"
+// and every denied CRD before that one kind got its own case -- and it
+// means the very next new discovery kind (from a future apiserver version,
+// or a client requesting some other aggregated shape) reintroduces the same
+// bypass. The default case must fail closed, not pass through, in
+// ro-nosecret.
+func TestFilterBodyRejectsUnrecognizedKind(t *testing.T) {
+	body := []byte(`{"kind":"SomeFutureDiscoveryKind","apiVersion":"v1","resources":[
+		{"name":"secrets","namespaced":true,"kind":"Secret","verbs":["list"]}]}`)
+	out, changed, err := FilterBody(engine(t, policy.ModeRONoSecret), "/api/v1", body)
+	if err == nil {
+		t.Fatal("an unrecognized discovery kind must be an error, not a passthrough")
+	}
+	if changed {
+		t.Error("changed must be false alongside an error")
+	}
+	if strings.Contains(string(out), "secrets") {
+		t.Error("secrets must never survive in the returned output")
+	}
+}
+
 // TestFilterResourceListRejectsNonArrayResources guards a fail-open a
 // reviewer demonstrated live: when "resources" is present but not an array
 // (or is missing entirely), filterResourceList used to report "unchanged",

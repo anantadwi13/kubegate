@@ -47,8 +47,22 @@ func FilterBody(e *policy.Engine, path string, body []byte) ([]byte, bool, error
 		changed, err = filterGroupList(e, root)
 	case "APIGroupDiscoveryList":
 		changed, err = filterAggregatedDiscoveryList(e, root)
-	default:
+	case "APIVersions":
+		// The bare /api response: a list of core API versions and server
+		// address CIDRs, never a resource listing. There is no resource
+		// type here that could be advertised past the mode's allowlist, so
+		// this is a deliberate, safe passthrough rather than the
+		// fail-closed default below.
 		return body, false, nil
+	default:
+		// An unrecognized kind at a discovery path is never a safe
+		// passthrough in ro-nosecret. This exact fail-open shape (an
+		// unhandled kind falling through to the original, unfiltered body)
+		// is what let APIGroupDiscoveryList leak "secrets" and every
+		// denied CRD before it got its own case above -- adding one case
+		// at a time and leaving the default permissive just moves the same
+		// bug to whichever kind is discovered next. Fail closed instead.
+		return nil, false, fmt.Errorf("unrecognized discovery document kind %q at %s", root["kind"], path)
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("filtering discovery document at %s: %w", path, err)
