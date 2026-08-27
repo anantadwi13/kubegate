@@ -45,6 +45,8 @@ func FilterBody(e *policy.Engine, path string, body []byte) ([]byte, bool, error
 		changed, err = filterResourceList(e, root)
 	case "APIGroupList":
 		changed, err = filterGroupList(e, root)
+	case "APIGroupDiscoveryList":
+		changed, err = filterAggregatedDiscoveryList(e, root)
 	default:
 		return body, false, nil
 	}
@@ -146,6 +148,180 @@ func filterGroupList(e *policy.Engine, root map[string]any) (bool, error) {
 	}
 	root["groups"] = kept
 	return true, nil
+}
+
+// filterAggregatedDiscoveryList is the APIGroupDiscoveryList analog of
+// filterResourceList and filterGroupList combined.
+//
+// kubectl 1.30+ (and any discovery client requesting the
+// apidiscovery.k8s.io media type) fetches /api and /apis in one aggregated
+// shape instead of walking each group/version's own APIResourceList. Before
+// this handled that kind, FilterBody's default case passed it straight
+// through unfiltered -- a real fail-open found by driving a current kubectl
+// through a real proxy against a real k3s >=1.30 apiserver: strict mode's
+// `kubectl api-resources` advertised "secrets" and every denied CRD intact,
+// even though direct GETs on them were still correctly denied by Authorize.
+// The redaction/policy path must never fail open, so this is fixed the same
+// way as the other two shapes: an unexpected field type is an error, never
+// a silent passthrough.
+func filterAggregatedDiscoveryList(e *policy.Engine, root map[string]any) (bool, error) {
+	raw, present := root["items"]
+	if !present {
+		return false, fmt.Errorf(`APIGroupDiscoveryList has no "items" field`)
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return false, fmt.Errorf(`APIGroupDiscoveryList "items" field is not an array`)
+	}
+
+	kept := make([]any, 0, len(items))
+	var changed bool
+	for _, entry := range items {
+		g, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		// The core group's entry has no "metadata.name" at all, matching
+		// PermitsGroup's and the Request.APIGroup convention that "" means
+		// core.
+		meta, _ := g["metadata"].(map[string]any)
+		group := str(meta["name"])
+
+		if !e.PermitsGroup(group) {
+			changed = true
+			continue
+		}
+		vChanged, err := filterAggregatedVersions(e, group, g)
+		if err != nil {
+			return false, err
+		}
+		changed = changed || vChanged
+		kept = append(kept, g)
+	}
+	if !changed {
+		return false, nil
+	}
+	root["items"] = kept
+	return true, nil
+}
+
+func filterAggregatedVersions(e *policy.Engine, group string, g map[string]any) (bool, error) {
+	raw, present := g["versions"]
+	if !present {
+		return false, fmt.Errorf(`APIGroupDiscovery entry for group %q has no "versions" field`, group)
+	}
+	versions, ok := raw.([]any)
+	if !ok {
+		return false, fmt.Errorf(`APIGroupDiscovery entry for group %q has a non-array "versions" field`, group)
+	}
+	var changed bool
+	for _, entry := range versions {
+		v, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		vChanged, err := filterAggregatedResources(e, group, str(v["version"]), v)
+		if err != nil {
+			return false, err
+		}
+		changed = changed || vChanged
+	}
+	return changed, nil
+}
+
+func filterAggregatedResources(e *policy.Engine, group, version string, v map[string]any) (bool, error) {
+	raw, present := v["resources"]
+	if !present {
+		// A version can legitimately have no "resources" field at all: a
+		// real k3s apiserver was observed advertising metrics.k8s.io/v1beta1
+		// with "freshness":"Stale" and no "resources" key whenever the
+		// metrics-server backend has registered its APIService but has not
+		// answered a discovery call yet. That is the documented meaning of
+		// "Stale" -- the aggregator could not gather this group/version's
+		// resources right now -- not a malformed response, so there is
+		// nothing here to filter. Treating it as an error would turn a
+		// transient, entirely normal startup window into a hard failure for
+		// every kubectl command, since a client's discovery walk fetches
+		// every group up front. A present-but-wrong-typed field is still
+		// treated as an error below: that shape is never legitimate.
+		return false, nil
+	}
+	resources, ok := raw.([]any)
+	if !ok {
+		return false, fmt.Errorf(`APIGroupDiscoveryVersion %s/%s has a non-array "resources" field`, group, version)
+	}
+
+	kept := make([]any, 0, len(resources))
+	var changed bool
+	for _, entry := range resources {
+		r, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := str(r["resource"])
+		req := policy.Request{
+			IsResourceRequest: true,
+			Verb:              "list",
+			APIGroup:          group,
+			APIVersion:        version,
+			Resource:          name,
+		}
+		if !e.AuthorizesResourceKind(req).Allow {
+			changed = true
+			continue
+		}
+		if filterAggregatedSubresources(e, group, version, name, r) {
+			changed = true
+		}
+		kept = append(kept, r)
+	}
+	if changed {
+		v["resources"] = kept
+	}
+	return changed, nil
+}
+
+// filterAggregatedSubresources drops entries from a resource's nested
+// "subresources" array, mirroring how the flat APIResourceList format
+// evaluates a "pods/log"-style entry independently of "pods" itself: a
+// subresource is never listable, so it is probed with get/probe exactly as
+// filterResourceList does.
+func filterAggregatedSubresources(e *policy.Engine, group, version, resource string, r map[string]any) bool {
+	raw, present := r["subresources"]
+	if !present {
+		return false
+	}
+	subs, ok := raw.([]any)
+	if !ok {
+		return false
+	}
+
+	kept := make([]any, 0, len(subs))
+	var changed bool
+	for _, entry := range subs {
+		s, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		req := policy.Request{
+			IsResourceRequest: true,
+			Verb:              "get",
+			APIGroup:          group,
+			APIVersion:        version,
+			Resource:          resource,
+			Subresource:       str(s["subresource"]),
+			Name:              "probe",
+		}
+		if e.AuthorizesResourceKind(req).Allow {
+			kept = append(kept, s)
+		} else {
+			changed = true
+		}
+	}
+	if changed {
+		r["subresources"] = kept
+	}
+	return changed
 }
 
 func splitGroupVersion(gv string) (group, version string) {

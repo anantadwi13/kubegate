@@ -165,6 +165,25 @@ func modeResourceDecision(m Mode, extra RuleSet, req Request) Decision {
 	return Decision{Reason: fmt.Sprintf("%s is not in the %s allowlist", resourceDesc(req), ModeRONoSecret)}
 }
 
+// RONoSecretResourceKeys returns the ro-nosecret allowlist as
+// "group/resource" strings, one per (group, resource) pair.
+//
+// It exists so the end-to-end classification test can check every allowlist
+// entry against what the cluster actually advertises. A typo or a stale API
+// group silently denies a resource we believe we permit, and no allow/deny
+// assertion notices, because the path never appears in a hand-written table.
+func RONoSecretResourceKeys() []string {
+	var out []string
+	for _, r := range roNoSecretAllow {
+		for _, g := range r.APIGroups {
+			for _, res := range r.Resources {
+				out = append(out, g+"/"+res)
+			}
+		}
+	}
+	return out
+}
+
 // resourceDesc renders a request the way a Kubernetes error message would.
 func resourceDesc(req Request) string {
 	name := req.Resource

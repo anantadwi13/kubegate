@@ -167,3 +167,27 @@ func TestModeResourceDecisionHonoursExtraRules(t *testing.T) {
 		t.Error("extra rules must not admit unlisted resources")
 	}
 }
+
+func TestRONoSecretResourceKeys(t *testing.T) {
+	keys := RONoSecretResourceKeys()
+	if len(keys) == 0 {
+		t.Fatal("allowlist keys must not be empty")
+	}
+	want := map[string]bool{
+		"/pods":                false,
+		"/pods/log":            false,
+		"apps/deployments":     false,
+		"events.k8s.io/events": false,
+		"metrics.k8s.io/pods":  false,
+	}
+	for _, k := range keys {
+		if _, ok := want[k]; ok {
+			want[k] = true
+		}
+	}
+	for k, found := range want {
+		if !found {
+			t.Errorf("expected key %q in the allowlist", k)
+		}
+	}
+}
