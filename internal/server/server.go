@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -29,6 +30,20 @@ import (
 // no body-bearing verbs, so a body arriving there is already anomalous and
 // should be truncated rather than buffered.
 const MaxBodyBytes = 8 << 20
+
+// MaxResponseBodyBytes caps how much of an upstream response modifyResponse
+// buffers for redaction and discovery filtering. This is deliberately a
+// separate, much larger constant from MaxBodyBytes: that one caps guest
+// REQUEST bodies low because no read-only mode permits body-bearing verbs,
+// so any request body is already anomalous, but a real cluster's own list
+// RESPONSES are exactly what read-only kubectl commands exist to return and
+// can legitimately be far larger. Reusing MaxBodyBytes here once truncated a
+// live `kubectl get pods -A` response mid-string, which json.Unmarshal then
+// rejected as invalid JSON, failing closed on a perfectly good response.
+//
+// A var, not a const: tests exercise the cap-exceeded path by lowering it
+// rather than allocating a genuine 128 MiB body.
+var MaxResponseBodyBytes int64 = 128 << 20
 
 // Options are the collaborators a handler needs. All are required.
 type Options struct {
@@ -106,7 +121,13 @@ func writeProxyError(w http.ResponseWriter, _ *http.Request, err error) {
 	var re *errRedaction
 	switch {
 	case errors.As(err, &re):
-		// Never forward bytes we could not inspect.
+		// Never forward bytes we could not inspect. The real cause (a JSON
+		// decode error, an unexpected Content-Type, an unrecognized
+		// discovery kind, ...) is never sent to the guest, but it is safe
+		// and useful on the host's own stderr: this is the only place that
+		// detail survives, since a custom ErrorHandler suppresses
+		// httputil.ReverseProxy's own "http: proxy error" log line.
+		log.Printf("kubegate: %v", re.err)
 		WriteStatus(w, http.StatusInternalServerError, string(metav1.StatusReasonInternalError),
 			"kubegate could not process the cluster response and refused to forward it unchecked")
 
@@ -329,13 +350,19 @@ func (h *handler) modifyResponse(resp *http.Response) error {
 		return nil
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxBodyBytes))
+	// Read one byte past the cap so a response that hit it can be told apart
+	// from one that just happens to be exactly MaxResponseBodyBytes long.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBodyBytes+1))
 	closeErr := resp.Body.Close()
 	if err != nil {
 		return err
 	}
 	if closeErr != nil {
 		return closeErr
+	}
+	if int64(len(body)) > MaxResponseBodyBytes {
+		return &errRedaction{fmt.Errorf("%s %s: response exceeds %d bytes, refusing to buffer further for redaction",
+			resp.Request.Method, resp.Request.URL.Path, MaxResponseBodyBytes)}
 	}
 
 	out := body
@@ -348,7 +375,9 @@ func (h *handler) modifyResponse(resp *http.Response) error {
 	if isDiscovery && resp.StatusCode == http.StatusOK {
 		filtered, filterChanged, ferr := discovery.FilterBody(h.opts.Engine, resp.Request.URL.Path, out)
 		if ferr != nil {
-			return &errRedaction{ferr}
+			return &errRedaction{fmt.Errorf("%s %s: content-type=%q content-encoding=%q bytes=%d: %w",
+				resp.Request.Method, resp.Request.URL.Path,
+				resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"), len(out), ferr)}
 		}
 		out = filtered
 		changed = changed || filterChanged
@@ -358,7 +387,9 @@ func (h *handler) modifyResponse(resp *http.Response) error {
 		if rerr != nil {
 			// Never forward bytes we could not inspect: failing open here
 			// would silently void the mode's guarantee.
-			return &errRedaction{rerr}
+			return &errRedaction{fmt.Errorf("%s %s: content-type=%q content-encoding=%q bytes=%d: %w",
+				resp.Request.Method, resp.Request.URL.Path,
+				resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"), len(out), rerr)}
 		}
 		out = redacted
 		changed = changed || redactChanged

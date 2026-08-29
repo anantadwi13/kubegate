@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -749,6 +750,68 @@ func TestHandlerStripsAcceptEncodingBeforeForwarding(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `"kind":"PodList"`) {
 		t.Errorf("body = %s, want the decompressed PodList", rec.Body.String())
 	}
+}
+
+// TestHandlerBuffersResponsesUpToTheResponseCap guards a second regression
+// found live, right after the compression fix above: a real, uncompressed
+// `kubectl get pods -A` against a real cluster still failed with the same
+// "kubegate could not process the cluster response" error, now diagnosed
+// (via the host stderr log modifyResponse emits on this path) as "invalid
+// character ' ' in string escape code" at exactly 8388608 bytes --
+// MaxBodyBytes, the REQUEST-body cap, was being reused by mistake to also
+// cap the RESPONSE buffer read in modifyResponse. A real cluster's own list
+// response is exactly what a read-only mode's kubectl commands exist to
+// return and can legitimately be far larger than any request body ever
+// would be; truncating it mid-string produced invalid JSON that redact.Body
+// correctly, but misleadingly, rejected.
+//
+// MaxResponseBodyBytes is now a separate cap, and a response that exceeds
+// it fails with an explicit "response exceeds N bytes" diagnosis rather
+// than falling through to a confusing JSON decode error. This test lowers
+// the cap to a size a unit test can afford to allocate rather than proving
+// the fix by allocating a genuine 128 MiB body.
+func TestHandlerBuffersResponsesUpToTheResponseCap(t *testing.T) {
+	origCap := MaxResponseBodyBytes
+	MaxResponseBodyBytes = 1024
+	t.Cleanup(func() { MaxResponseBodyBytes = origCap })
+
+	t.Run("under the cap passes through untouched", func(t *testing.T) {
+		body := fmt.Sprintf(`{"kind":"PodList","apiVersion":"v1","metadata":{},"items":[],"filler":"%s"}`,
+			strings.Repeat("a", 800))
+		up := jsonUpstream(t, body)
+		h := harness(t, policy.ModeRONoSecret, up)
+
+		rec := do(t, h, "GET", "/api/v1/pods", true)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		if rec.Body.String() != body {
+			t.Errorf("body was altered even though nothing needed redacting:\ngot  %s\nwant %s", rec.Body.String(), body)
+		}
+	})
+
+	t.Run("over the cap fails closed with a diagnosable message, not a truncated-JSON parse error", func(t *testing.T) {
+		body := fmt.Sprintf(`{"kind":"PodList","apiVersion":"v1","metadata":{},"items":[],"filler":"%s"}`,
+			strings.Repeat("a", 2000))
+		up := jsonUpstream(t, body)
+		h := harness(t, policy.ModeRONoSecret, up)
+
+		var logbuf bytes.Buffer
+		origOut := log.Writer()
+		log.SetOutput(&logbuf)
+		t.Cleanup(func() { log.SetOutput(origOut) })
+
+		rec := do(t, h, "GET", "/api/v1/pods", true)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", rec.Code)
+		}
+		if !strings.Contains(logbuf.String(), "response exceeds") {
+			t.Errorf("expected the explicit cap-exceeded diagnosis in the host log, got: %s", logbuf.String())
+		}
+		if strings.Contains(logbuf.String(), "invalid character") {
+			t.Errorf("hit the JSON-decode error path instead of the explicit cap check: %s", logbuf.String())
+		}
+	})
 }
 
 // TestHandlerWatchQueryParamCannotBypassDiscoveryFiltering guards the second
