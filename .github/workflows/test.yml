@@ -1,0 +1,84 @@
+name: test
+
+on:
+  # No branch filter: unit/integration run on every push, on any branch, in
+  # this repo or a fork. The e2e job additionally restricts *itself* (see
+  # its own `if`) to the canonical repo only.
+  push: {}
+  pull_request:
+    branches: [master]
+  workflow_dispatch: {}
+
+concurrency:
+  # `github.ref` differs between a push (refs/heads/<branch>) and the
+  # matching pull_request (refs/pull/<n>/merge), so grouping on it wouldn't
+  # catch the case where both fire for the same commit on a same-repo PR
+  # branch. `head_ref` (only set for pull_request) falling back to
+  # `ref_name` (the plain branch name push provides) makes both land in the
+  # same group, so the later one cancels the earlier instead of both
+  # running to completion.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: make test
+
+  integration:
+    name: integration (envtest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # `make test-integration` depends on `envtest`, which installs
+      # setup-envtest and downloads the pinned apiserver binaries itself.
+      - run: make test-integration
+
+  e2e:
+    name: e2e (k3d)
+    runs-on: ubuntu-latest
+    # A plain `push` only auto-queues this job on the canonical repo — never
+    # on a fork. A fork's own push therefore costs a contributor nothing
+    # unless they explicitly ask for it via workflow_dispatch (their own CI
+    # minutes, their choice); pull_request and workflow_dispatch are always
+    # eligible regardless of which repo is running, since both are always
+    # either an explicit action or executes in the canonical repo's context.
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.repository == 'anantadwi13/kubegate')
+    # `workflow_dispatch` and push-to-master are both already a deliberate,
+    # explicit action, so they target `e2e-auto` (no protection rule) and
+    # run immediately — including on a fork, where `e2e-auto` doesn't exist
+    # and GitHub auto-creates it unprotected on first reference. Everything
+    # else — a push to any other branch on the canonical repo, or a
+    # pull_request (fork or not) — targets `e2e-review`, which needs a
+    # one-time setup in this repo's Settings > Environments: create it and
+    # add required reviewers. The job then shows up as a check on that
+    # commit/PR, sitting "Waiting" — a maintainer clicks "Review
+    # deployments" to run it, per commit, whenever they want to check.
+    # Nobody clicking it never blocks anything: it isn't a required status
+    # check, so an unapproved e2e run just sits pending without affecting
+    # mergeability.
+    environment: ${{ (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master') && 'e2e-auto' || 'e2e-review' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install k3d
+        run: curl -sfL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG=v5.9.0 bash
+      # kubectl and Docker are preinstalled on GitHub-hosted ubuntu runners.
+      - run: make test-e2e
