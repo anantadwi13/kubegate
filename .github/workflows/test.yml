@@ -10,7 +10,14 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # `github.ref` differs between a push (refs/heads/<branch>) and the
+  # matching pull_request (refs/pull/<n>/merge), so grouping on it wouldn't
+  # catch the case where both fire for the same commit on a same-repo PR
+  # branch. `head_ref` (only set for pull_request) falling back to
+  # `ref_name` (the plain branch name push provides) makes both land in the
+  # same group, so the later one cancels the earlier instead of both
+  # running to completion.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
