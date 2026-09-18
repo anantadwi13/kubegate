@@ -87,8 +87,16 @@ func newCluster(t *testing.T) *cluster {
 	// A stale cluster from an interrupted run would poison this one.
 	_, _ = run(t, 2*time.Minute, "k3d", "cluster", "delete", clusterName)
 
+	// Traefik, k3s's bundled default ingress controller, installs
+	// asynchronously via an internal Helm job -- whether it finishes within
+	// this test's window is a race against image-pull speed, which differs
+	// by environment (it's consistently lost in one sandbox and consistently
+	// won on GitHub Actions, adding 19 Traefik CRDs to the discovery walk
+	// either way). It's irrelevant to what's under test here, so disable it
+	// outright rather than let its presence be nondeterministic.
 	if out, err := run(t, 10*time.Minute, "k3d", "cluster", "create", clusterName,
-		"--agents", "1", "--image", k3sImage, "--wait"); err != nil {
+		"--agents", "1", "--image", k3sImage, "--wait",
+		"--k3s-arg", "--disable=traefik@server:*"); err != nil {
 		t.Fatalf("creating k3d cluster: %v\n%s", err, out)
 	}
 	t.Cleanup(func() {
