@@ -132,10 +132,31 @@ func TestDiscoveryWalkClassification(t *testing.T) {
 		t.Fatalf("golden file missing; run with UPDATE_GOLDEN=1 to create it: %v", err)
 	}
 	if string(want) != actual {
+		wantLines := strings.Split(strings.TrimRight(string(want), "\n"), "\n")
+		wantSet := map[string]bool{}
+		for _, l := range wantLines {
+			wantSet[l] = true
+		}
+		gotSet := map[string]bool{}
+		for _, l := range lines {
+			gotSet[l] = true
+		}
+		var added, removed []string
+		for _, l := range lines {
+			if !wantSet[l] {
+				added = append(added, l)
+			}
+		}
+		for _, l := range wantLines {
+			if !gotSet[l] {
+				removed = append(removed, l)
+			}
+		}
 		t.Errorf("classification changed. Review the diff carefully: a new CRD "+
 			"appearing here means it is now reachable or newly denied.\n"+
 			"Re-run with UPDATE_GOLDEN=1 once you have confirmed the change is intended.\n"+
-			"got %d entries, want %d", len(lines), strings.Count(string(want), "\n"))
+			"got %d entries, want %d\nadded (%d):\n%s\nremoved (%d):\n%s",
+			len(lines), len(wantLines), len(added), strings.Join(added, "\n"), len(removed), strings.Join(removed, "\n"))
 	}
 }
 
