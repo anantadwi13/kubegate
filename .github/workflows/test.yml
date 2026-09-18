@@ -39,11 +39,6 @@ jobs:
   e2e:
     name: e2e (k3d)
     runs-on: ubuntu-latest
-    # Automatic on push to master. On a pull request it does NOT run
-    # automatically — creating real k3d clusters costs several minutes and
-    # isn't cheap enough for every push to every PR. Trigger it by hand
-    # from the Actions tab ("Run workflow") instead.
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
