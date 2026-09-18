@@ -1,0 +1,56 @@
+name: test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: make test
+
+  integration:
+    name: integration (envtest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # `make test-integration` depends on `envtest`, which installs
+      # setup-envtest and downloads the pinned apiserver binaries itself.
+      - run: make test-integration
+
+  e2e:
+    name: e2e (k3d)
+    runs-on: ubuntu-latest
+    # Automatic on push to master. On a pull request it does NOT run
+    # automatically — creating real k3d clusters costs several minutes and
+    # isn't cheap enough for every push to every PR. Trigger it by hand
+    # from the Actions tab ("Run workflow") instead.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install k3d
+        run: curl -sfL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG=v5.9.0 bash
+      # kubectl and Docker are preinstalled on GitHub-hosted ubuntu runners.
+      - run: make test-e2e
