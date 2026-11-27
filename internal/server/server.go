@@ -77,6 +77,13 @@ func NewHandler(o Options) (http.Handler, error) {
 			r.Out.URL.Scheme = base.Scheme
 			r.Out.URL.Host = base.Host
 			r.Out.Host = base.Host
+			// Clusters fronted by a gateway (e.g. https://gw.example.com/v1/proxy/<id>)
+			// carry a path prefix in the kubeconfig server URL. Preserve it,
+			// or every request lands on the gateway root and 404s.
+			if base.Path != "" {
+				r.Out.URL.Path = strings.TrimSuffix(base.Path, "/") + r.Out.URL.Path
+				r.Out.URL.RawPath = ""
+			}
 
 			// Strip the client's own Accept-Encoding. net/http's Transport
 			// only takes over compression itself -- adding its own
