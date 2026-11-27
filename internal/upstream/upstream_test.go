@@ -150,3 +150,71 @@ func TestProbeFailsOnUnreachable(t *testing.T) {
 		t.Error("an unreachable cluster must fail the probe")
 	}
 }
+
+func TestNewKeepsServerURLPathPrefix(t *testing.T) {
+	cases := []struct{ server, wantPath string }{
+		{"https://gw.example.com", ""},
+		{"https://gw.example.com/", ""},
+		{"https://gw.example.com/v1/proxy/abc123", "/v1/proxy/abc123"},
+		{"https://gw.example.com/v1/proxy/abc123/", "/v1/proxy/abc123/"},
+	}
+	for _, tc := range cases {
+		u, err := New(writeKubeconfig(t, tc.server, tc.server), "ctx-a")
+		if err != nil {
+			t.Fatalf("%s: %v", tc.server, err)
+		}
+		if got := u.BaseURL().Path; got != tc.wantPath {
+			t.Errorf("%s: BaseURL path = %q, want %q", tc.server, got, tc.wantPath)
+		}
+	}
+}
+
+func TestProbeHonoursServerURLPathPrefix(t *testing.T) {
+	cases := []struct{ name, prefix, wantPath string }{
+		{"no prefix", "", "/version"},
+		{"bare slash", "/", "/version"},
+		{"prefix", "/v1/proxy/abc123", "/v1/proxy/abc123/version"},
+		{"prefix with trailing slash", "/v1/proxy/abc123/", "/v1/proxy/abc123/version"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+
+			u, err := New(writeKubeconfig(t, srv.URL+tc.prefix, srv.URL+tc.prefix), "ctx-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := u.Probe(context.Background()); err != nil {
+				t.Fatalf("Probe: %v", err)
+			}
+			if gotPath != tc.wantPath {
+				t.Errorf("probe hit %q, want %q", gotPath, tc.wantPath)
+			}
+		})
+	}
+}
+
+// Probing must not mutate the stored base URL: BaseURL hands out copies, and
+// the proxy's Rewrite relies on the prefix surviving every later call.
+func TestProbeDoesNotMutateBaseURL(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	u, err := New(writeKubeconfig(t, srv.URL+"/gw", srv.URL+"/gw"), "ctx-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := u.Probe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := u.BaseURL().Path; got != "/gw" {
+		t.Errorf("BaseURL path after Probe = %q, want /gw", got)
+	}
+}

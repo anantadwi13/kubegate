@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -100,7 +101,7 @@ func (u *Upstream) ContextName() string { return u.contextName }
 // traverse the middleware chain: there is no inbound request to authorize.
 func (u *Upstream) Probe(ctx context.Context) error {
 	target := u.BaseURL()
-	target.Path = "/version"
+	target.Path = strings.TrimSuffix(target.Path, "/") + "/version"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return err
