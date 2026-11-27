@@ -85,9 +85,16 @@ func negotiatingUpstream(t *testing.T, jsonBody, yamlBody string) *upstreamRecor
 // harness builds a handler wired to a fake upstream.
 func harness(t *testing.T, mode policy.Mode, up *upstreamRecorder) http.Handler {
 	t.Helper()
+	return harnessAt(t, mode, up.srv.URL)
+}
+
+// harnessAt is harness with an explicit kubeconfig server URL, so a test can
+// append a gateway path prefix to the fake upstream's address.
+func harnessAt(t *testing.T, mode policy.Mode, serverURL string) http.Handler {
+	t.Helper()
 
 	kc := filepath.Join(t.TempDir(), "kubeconfig")
-	content := "apiVersion: v1\nkind: Config\nclusters:\n  - name: c\n    cluster:\n      server: " + up.srv.URL +
+	content := "apiVersion: v1\nkind: Config\nclusters:\n  - name: c\n    cluster:\n      server: " + serverURL +
 		"\n      insecure-skip-tls-verify: true\nusers:\n  - name: u\n    user:\n      token: upstream-token\n" +
 		"contexts:\n  - name: ctx\n    context: {cluster: c, user: u}\ncurrent-context: ctx\n"
 	if err := os.WriteFile(kc, []byte(content), 0o600); err != nil {
